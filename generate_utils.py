@@ -1,37 +1,40 @@
 import re
 from typing import Sequence
 
-def _parse_response(texts: Sequence[str], patterns: Sequence[str]) -> list[dict[str, int]]:
+def _parse_response(texts: Sequence[str], patterns: Sequence[str]) -> list[dict[str, list[int] | None]]:
     """
-    Parse text strings to extract numeric values associated with patterns.
+    Parse text sequences to extract numbers associated with specific patterns.
     
     Args:
-        texts: Sequence of text strings to parse
+        texts: Sequence of strings to parse
         patterns: Sequence of pattern strings to search for
         
     Returns:
-        List of dictionaries mapping pattern names to extracted integers
+        List of dictionaries, one per text, mapping each pattern to:
+        - list of integers if pattern found with numbers
+        - None if pattern not found
     """
     results = []
     
     for text in texts:
-        result_dict = {}
+        text_result = {}
         
         for pattern in patterns:
-            # Create regex pattern that matches:
-            # - the pattern word (case-insensitive, allowing slight variations)
-            # - optional separator characters (: , ; space, etc.)
-            # - a number (integer)
-            regex_pattern = rf'\b{re.escape(pattern)}\b\s*[:;,]?\s*(-?\d+)'
+            # Create regex to find pattern followed by optional separator and number
+            # Pattern: exact pattern match + optional `:` or space + capture digits
+            regex = rf'\b{re.escape(pattern)}\s*:?\s*(\d+)'
             
-            match = re.search(regex_pattern, text, re.IGNORECASE)
+            # Find all occurrences
+            matches = re.findall(regex, text)
             
-            if match:
-                result_dict[pattern] = int(match.group(1))
+            if matches:
+                # Convert string matches to integers
+                text_result[pattern] = [int(m) for m in matches]
             else:
-                result_dict[pattern] = None
+                # Pattern not found in text
+                text_result[pattern] = None
         
-        results.append(result_dict)
+        results.append(text_result)
     
     return results
 

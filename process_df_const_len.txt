@@ -1,0 +1,61 @@
+def process_df(trans: pl.DataFrame, batch_size: int, agg_col: str, max_days: int) -> dict:
+    application_ids = trans["unique_app_id"].unique().to_list()
+    num_batches = math.ceil(len(application_ids) / batch_size)
+    objects = {}
+
+    unique_mcc_set = set(UNIQUE_MCC_GROUPS)
+    full_days = np.arange(max_days, dtype=int)  # [0, 1, 2, ..., max_days-1]
+    zeros = np.zeros(max_days, dtype=int)
+
+    for i in tqdm(range(num_batches), desc="processing batches"):
+        app_id_batch = application_ids[i * batch_size : (i + 1) * batch_size]
+
+        feats = get_seq_features(
+            trans.filter(pl.col("unique_app_id").is_in(app_id_batch)), agg_col
+        )
+
+        partitions = feats.sort(agg_col, descending=True).partition_by(
+            "unique_app_id", maintain_order=True
+        )
+
+        for app_feats in partitions:
+            app_id = app_feats["unique_app_id"][0]
+            app_feats = app_feats.drop("unique_app_id")
+
+            app_data = (
+                app_feats.pivot(on=agg_col, index="mcc_group_name", values="sum")
+                .fill_null(0)
+            )
+
+            mcc_groups = app_data["mcc_group_name"].to_list()
+            value_cols = app_data.columns[1:]
+            existing_days = np.array(value_cols, dtype=int)
+
+            # Map existing days to positions in the full range
+            mat = app_data.select(value_cols).to_numpy().astype(int)  # (n_mcc, n_existing_days)
+
+            # Create full-size matrix and scatter existing values into correct positions
+            full_mat = np.zeros((len(mcc_groups), max_days), dtype=int)
+            # Only keep days that fall within [0, max_days)
+            mask = existing_days < max_days
+            if mask.any():
+                full_mat[:, existing_days[mask]] = mat[:, mask]
+
+            result = {
+                mcc_groups[j]: full_mat[j] for j in range(len(mcc_groups))
+            }
+            result[agg_col] = full_days
+
+            # Missing MCC groups — all zeros, fixed length
+            for mcc_group in unique_mcc_set - set(mcc_groups):
+                result[mcc_group] = zeros
+
+            parts = app_id.split("_", 1)
+            objects[app_id] = {
+                "feature_arrays": result,
+                "APPLICATION_ID": parts[1],
+                "APPLICATION_DATE": parts[0],
+                "SEQ_LENGTH": max_days,
+            }
+
+    return objects

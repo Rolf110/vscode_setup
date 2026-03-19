@@ -1,0 +1,73 @@
+import numpy as np
+
+def auc_optimal_buckets_greedy(scores, y, n_buckets):
+    scores = np.asarray(scores)
+    y = np.asarray(y).astype(int)
+
+    order = np.argsort(scores)
+    scores_sorted = scores[order]
+    y_sorted = y[order]
+
+    # group equal scores first, so we do not create artificial order inside ties
+    buckets = []
+    start = 0
+    n = len(scores_sorted)
+
+    while start < n:
+        end = start + 1
+        while end < n and scores_sorted[end] == scores_sorted[start]:
+            end += 1
+
+        yy = y_sorted[start:end]
+        buckets.append({
+            "start": start,
+            "end": end,   # exclusive
+            "pos": int(yy.sum()),
+            "neg": int((end - start) - yy.sum()),
+            "min_score": scores_sorted[start],
+            "max_score": scores_sorted[end - 1],
+        })
+        start = end
+
+    if n_buckets >= len(buckets):
+        thresholds = [b["max_score"] for b in buckets[:-1]]
+        return thresholds, buckets
+
+    def merge_cost(left, right):
+        # AUC loss from collapsing boundary into tie
+        return 0.5 * (left["pos"] * right["neg"] + right["pos"] * left["neg"])
+
+    while len(buckets) > n_buckets:
+        costs = [merge_cost(buckets[i], buckets[i + 1]) for i in range(len(buckets) - 1)]
+        k = int(np.argmin(costs))
+
+        merged = {
+            "start": buckets[k]["start"],
+            "end": buckets[k + 1]["end"],
+            "pos": buckets[k]["pos"] + buckets[k + 1]["pos"],
+            "neg": buckets[k]["neg"] + buckets[k + 1]["neg"],
+            "min_score": buckets[k]["min_score"],
+            "max_score": buckets[k + 1]["max_score"],
+        }
+
+        buckets = buckets[:k] + [merged] + buckets[k + 2:]
+
+    thresholds = [b["max_score"] for b in buckets[:-1]]
+    return thresholds, buckets
+
+
+
+thresholds, buckets = auc_optimal_buckets_greedy(probs, y_true, n_buckets=10)
+print(thresholds)
+
+def apply_buckets(scores, thresholds):
+    return np.searchsorted(thresholds, scores, side="right")
+
+
+from sklearn.metrics import roc_auc_score
+
+bucket_scores = apply_buckets(probs, thresholds)
+auc_bucketed = roc_auc_score(y_true, bucket_scores)
+auc_original = roc_auc_score(y_true, probs)
+
+print(auc_original, auc_bucketed)

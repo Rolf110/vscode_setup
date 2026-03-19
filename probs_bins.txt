@@ -71,3 +71,164 @@ auc_bucketed = roc_auc_score(y_true, bucket_scores)
 auc_original = roc_auc_score(y_true, probs)
 
 print(auc_original, auc_bucketed)
+
+
+
+import numpy as np
+
+def auc_optimal_buckets_greedy(scores, y, n_buckets):
+    """
+    Optimal ROC-AUC-preserving bucketing via dynamic programming.
+
+    Same interface as the previous greedy version:
+        thresholds, buckets = auc_optimal_buckets_greedy(scores, y, n_buckets)
+
+    Parameters
+    ----------
+    scores : array-like of shape (n_samples,)
+        Continuous model scores / probabilities.
+    y : array-like of shape (n_samples,)
+        Binary labels in {0,1}.
+    n_buckets : int
+        Desired number of contiguous score buckets.
+
+    Returns
+    -------
+    thresholds : list of float
+        Thresholds between buckets. Applying
+            np.searchsorted(thresholds, score, side="right")
+        gives bucket ids 0..n_buckets-1.
+    buckets : list of dict
+        Bucket metadata.
+    """
+    scores = np.asarray(scores)
+    y = np.asarray(y).astype(int)
+
+    if scores.ndim != 1 or y.ndim != 1 or len(scores) != len(y):
+        raise ValueError("scores and y must be 1D arrays of equal length")
+    if n_buckets < 1:
+        raise ValueError("n_buckets must be >= 1")
+    if not np.all((y == 0) | (y == 1)):
+        raise ValueError("y must contain only 0/1 labels")
+
+    n = len(scores)
+    if n == 0:
+        return [], []
+
+    # Sort by score, stable so equal-score ordering is deterministic
+    order = np.argsort(scores, kind="mergesort")
+    scores_sorted = scores[order]
+    y_sorted = y[order]
+
+    # Group equal scores first: splitting equal scores cannot improve AUC,
+    # because equal original scores are already ties.
+    groups = []
+    start = 0
+    while start < n:
+        end = start + 1
+        while end < n and scores_sorted[end] == scores_sorted[start]:
+            end += 1
+
+        yy = y_sorted[start:end]
+        pos = int(yy.sum())
+        neg = int((end - start) - pos)
+
+        groups.append({
+            "start": start,
+            "end": end,  # exclusive, in sorted sample indexing
+            "pos": pos,
+            "neg": neg,
+            "min_score": scores_sorted[start],
+            "max_score": scores_sorted[end - 1],
+        })
+        start = end
+
+    m = len(groups)
+    if n_buckets >= m:
+        thresholds = [g["max_score"] for g in groups[:-1]]
+        return thresholds, groups
+
+    # Prefix counts over equal-score groups
+    pos_prefix = np.zeros(m + 1, dtype=np.int64)
+    neg_prefix = np.zeros(m + 1, dtype=np.int64)
+    for i, g in enumerate(groups, start=1):
+        pos_prefix[i] = pos_prefix[i - 1] + g["pos"]
+        neg_prefix[i] = neg_prefix[i - 1] + g["neg"]
+
+    def seg_pos(i, j):
+        # inclusive group interval [i, j]
+        return pos_prefix[j + 1] - pos_prefix[i]
+
+    def seg_neg(i, j):
+        return neg_prefix[j + 1] - neg_prefix[i]
+
+    # DP:
+    # dp[k][j] = best AUC numerator contribution achievable by partitioning
+    #            groups [0..j] into exactly k buckets.
+    #
+    # If last bucket is [i..j], then its contribution is:
+    #   P(i,j) * neg_prefix[i] + 0.5 * P(i,j) * N(i,j)
+    #
+    # because positives in this bucket beat all negatives in earlier buckets,
+    # and tie all negatives inside the same bucket.
+    #
+    # Full AUC = numerator / (total_pos * total_neg), but denominator is fixed,
+    # so maximizing numerator is enough.
+    NEG_INF = -1e300
+    dp = np.full((n_buckets + 1, m), NEG_INF, dtype=np.float64)
+    prev = np.full((n_buckets + 1, m), -1, dtype=np.int64)
+
+    # Base case: one bucket covering [0..j]
+    for j in range(m):
+        p = seg_pos(0, j)
+        q = seg_neg(0, j)
+        dp[1, j] = 0.5 * p * q
+
+    # Transitions
+    for k in range(2, n_buckets + 1):
+        # Need at least k groups to make k non-empty buckets
+        for j in range(k - 1, m):
+            best_val = NEG_INF
+            best_i = -1
+
+            # Last bucket starts at i, so previous k-1 buckets cover [0..i-1]
+            for i in range(k - 1, j + 1):
+                p = seg_pos(i, j)
+                q = seg_neg(i, j)
+                val = dp[k - 1, i - 1] + p * neg_prefix[i] + 0.5 * p * q
+                if val > best_val:
+                    best_val = val
+                    best_i = i
+
+            dp[k, j] = best_val
+            prev[k, j] = best_i
+
+    # Backtrack optimal segmentation
+    segments = []
+    k = n_buckets
+    j = m - 1
+    while k >= 1:
+        i = prev[k, j] if k > 1 else 0
+        if i < 0:
+            raise RuntimeError("Failed to reconstruct optimal bucketization")
+        segments.append((i, j))
+        j = i - 1
+        k -= 1
+    segments.reverse()
+
+    # Build bucket metadata
+    buckets = []
+    for i, j in segments:
+        pos = int(seg_pos(i, j))
+        neg = int(seg_neg(i, j))
+        buckets.append({
+            "start": groups[i]["start"],
+            "end": groups[j]["end"],
+            "pos": pos,
+            "neg": neg,
+            "min_score": groups[i]["min_score"],
+            "max_score": groups[j]["max_score"],
+        })
+
+    thresholds = [b["max_score"] for b in buckets[:-1]]
+    return thresholds, buckets

@@ -1,0 +1,114 @@
+from __future__ import annotations
+
+from typing import Any, Sequence
+
+from vllm import LLM, SamplingParams
+
+OpenAIMessage = dict[str, Any]
+Conversation = list[OpenAIMessage]
+
+
+def generate_chat_batch(
+    llm: LLM,
+    conversations: Sequence[Conversation],
+    sampling_params: SamplingParams,
+    *,
+    chat_template: str | None = None,
+    chat_template_content_format: str = "auto",
+    add_generation_prompt: bool = True,
+    continue_final_message: bool = False,
+    tools: list[dict[str, Any]] | None = None,
+    return_full_outputs: bool = False,
+) -> list[str] | list[Any]:
+    """
+    Fast batch generation for OpenAI-style chat messages using vLLM 0.14.0.
+
+    Parameters
+    ----------
+    llm:
+        A reused vLLM LLM instance. Do not construct it inside this function.
+    conversations:
+        Batch of OpenAI-format conversations:
+        [
+          [{"role": "system", "content": "..."},
+           {"role": "user", "content": "..."}],
+          ...
+        ]
+    sampling_params:
+        vllm.SamplingParams shared by the whole batch.
+    chat_template:
+        Optional Jinja chat template override for models whose tokenizer
+        doesn't define one.
+    chat_template_content_format:
+        Usually "auto". Leave it unless your model/template expects a specific
+        content schema.
+    add_generation_prompt:
+        Usually True for normal assistant generation.
+    continue_final_message:
+        Set True only when you want the model to continue the last assistant
+        message instead of starting a new one.
+    tools:
+        Optional OpenAI-style tool definitions for tool-calling models.
+    return_full_outputs:
+        If True, return raw RequestOutput objects; otherwise return strings.
+
+    Returns
+    -------
+    list[str] or list[RequestOutput]
+    """
+    if not conversations:
+        return []
+
+    # vLLM will tokenize each chat conversation into TokensPrompt objects.
+    # This is the same preprocessing path used by llm.chat(...), but exposed
+    # so you can cache / inspect / reuse the prompts if you want.
+    tokenized_prompts = llm.preprocess_chat(
+        messages=list(conversations),
+        chat_template=chat_template,
+        chat_template_content_format=chat_template_content_format,
+        add_generation_prompt=add_generation_prompt,
+        continue_final_message=continue_final_message,
+        tools=tools,
+    )
+
+    # Important: do NOT manually pad. vLLM accepts variable-length prompts.
+    outputs = llm.generate(
+        tokenized_prompts,
+        sampling_params=sampling_params,
+        use_tqdm=False,
+    )
+
+    if return_full_outputs:
+        return outputs
+
+    return [output.outputs[0].text for output in outputs]
+
+############################################################################################
+
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    tensor_parallel_size=1,
+    dtype="auto",
+    enable_prefix_caching=True,  # helpful when many prompts share a long prefix
+)
+
+sampling = SamplingParams(
+    temperature=0.0,
+    max_tokens=256,
+)
+
+batch = [
+    [
+        {"role": "system", "content": "You are concise."},
+        {"role": "user", "content": "Summarize gradient clipping in one paragraph."},
+    ],
+    [
+        {"role": "system", "content": "You are concise."},
+        {"role": "user", "content": "Explain dropout in one paragraph."},
+    ],
+]
+
+texts = generate_chat_batch(llm, batch, sampling)
+print(texts)

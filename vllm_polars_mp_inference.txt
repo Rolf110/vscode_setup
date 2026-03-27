@@ -1,0 +1,571 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import shutil
+import traceback
+from dataclasses import dataclass
+from multiprocessing import get_context
+from pathlib import Path
+from typing import Any, Sequence
+
+import polars as pl
+from tqdm import tqdm
+
+OpenAIMessage = dict[str, Any]
+Conversation = list[OpenAIMessage]
+
+
+def generate_chat_batch(
+    llm: Any,
+    conversations: Sequence[Conversation],
+    sampling_params: Any,
+    *,
+    chat_template: str | None = None,
+    chat_template_content_format: str = "auto",
+    add_generation_prompt: bool = True,
+    continue_final_message: bool = False,
+    tools: list[dict[str, Any]] | None = None,
+    return_full_outputs: bool = False,
+) -> list[str] | list[Any]:
+    """
+    Fast batch generation for OpenAI-style chat messages using vLLM.
+
+    Parameters
+    ----------
+    llm:
+        A reused vLLM LLM instance. Do not construct it inside this function.
+    conversations:
+        Batch of OpenAI-format conversations:
+        [
+          [{"role": "system", "content": "..."},
+           {"role": "user", "content": "..."}],
+          ...
+        ]
+    sampling_params:
+        vllm.SamplingParams shared by the whole batch.
+    chat_template:
+        Optional Jinja chat template override for models whose tokenizer
+        doesn't define one.
+    chat_template_content_format:
+        Usually "auto". Leave it unless your model/template expects a specific
+        content schema.
+    add_generation_prompt:
+        Usually True for normal assistant generation.
+    continue_final_message:
+        Set True only when you want the model to continue the last assistant
+        message instead of starting a new one.
+    tools:
+        Optional OpenAI-style tool definitions for tool-calling models.
+    return_full_outputs:
+        If True, return raw RequestOutput objects; otherwise return strings.
+
+    Returns
+    -------
+    list[str] or list[RequestOutput]
+    """
+    if not conversations:
+        return []
+
+    tokenized_prompts = llm.preprocess_chat(
+        messages=list(conversations),
+        chat_template=chat_template,
+        chat_template_content_format=chat_template_content_format,
+        add_generation_prompt=add_generation_prompt,
+        continue_final_message=continue_final_message,
+        tools=tools,
+    )
+
+    outputs = llm.generate(
+        tokenized_prompts,
+        sampling_params=sampling_params,
+        use_tqdm=False,
+    )
+
+    if return_full_outputs:
+        return outputs
+
+    return [output.outputs[0].text for output in outputs]
+
+
+def build_conversations_from_batch(
+    batch_df: pl.DataFrame,
+    *,
+    system_prompt: str,
+) -> list[Conversation]:
+    """
+    Convert a Polars batch into OpenAI-style chat conversations.
+
+    Replace this function with your exact prompt formatting if needed.
+    By default it uses the `answer` column as the user message.
+    """
+    user_messages = batch_df["answer"].to_list()
+    return [
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": str(user_msg)},
+        ]
+        for user_msg in user_messages
+    ]
+
+
+def build_output_batch(
+    batch_df: pl.DataFrame,
+    generated_texts: Sequence[str],
+    *,
+    rank: int,
+    batch_idx: int,
+) -> pl.DataFrame:
+    """
+    Shape of a single output batch written to parquet.
+
+    Edit this if you want extra columns in the final output.
+    """
+    return batch_df.select(["sample_key", "answer"]).with_columns(
+        pl.Series("model_output", list(generated_texts), dtype=pl.Utf8),
+        pl.lit(rank).alias("rank"),
+        pl.lit(batch_idx).alias("batch_idx"),
+    )
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    model: str
+    output_prefix: str
+    batch_size: int
+    total_gpus: int
+    sample_key_dtype: Any = pl.Utf8
+    answer_dtype: Any = pl.Utf8
+    tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
+    dtype: str = "auto"
+    gpu_memory_utilization: float = 0.90
+    max_model_len: int | None = None
+    enable_prefix_caching: bool = True
+    enforce_eager: bool = False
+    swap_space: int = 4
+    seed: int = 0
+
+    temperature: float = 0.0
+    top_p: float = 1.0
+    max_tokens: int = 256
+
+    system_prompt: str = "You are concise."
+
+    chat_template: str | None = None
+    chat_template_content_format: str = "auto"
+    add_generation_prompt: bool = True
+    continue_final_message: bool = False
+    tools: list[dict[str, Any]] | None = None
+
+    resume: bool = True
+    cleanup_parts: bool = True
+    compression: str = "snappy"
+
+    def gpus_per_worker(self) -> int:
+        return self.tensor_parallel_size * self.pipeline_parallel_size
+
+    def num_workers(self) -> int:
+        gpus_per_worker = self.gpus_per_worker()
+        if gpus_per_worker <= 0:
+            raise ValueError("tensor_parallel_size * pipeline_parallel_size must be >= 1")
+        if self.total_gpus % gpus_per_worker != 0:
+            raise ValueError(
+                f"total_gpus={self.total_gpus} is not divisible by "
+                f"gpus_per_worker={gpus_per_worker}"
+            )
+        return self.total_gpus // gpus_per_worker
+
+
+def ensure_required_columns(df: pl.DataFrame) -> None:
+    required = {"sample_key", "answer"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Input DataFrame is missing required columns: {sorted(missing)}")
+
+
+def compute_shard_bounds(total_rows: int, num_workers: int, rank: int) -> tuple[int, int]:
+    base = total_rows // num_workers
+    remainder = total_rows % num_workers
+    if rank < remainder:
+        start = rank * (base + 1)
+        length = base + 1
+    else:
+        start = remainder * (base + 1) + (rank - remainder) * base
+        length = base
+    return start, length
+
+
+def detect_visible_gpu_count() -> int:
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible_devices:
+        return len([gpu for gpu in cuda_visible_devices.split(",") if gpu.strip() != ""])
+    try:
+        import torch
+
+        return int(torch.cuda.device_count())
+    except Exception:
+        return 0
+
+
+def part_dir_for_rank(output_prefix: str, rank: int) -> Path:
+    return Path(f"{output_prefix}_{rank}.parts")
+
+
+def final_output_path(output_prefix: str, rank: int) -> Path:
+    return Path(f"{output_prefix}_{rank}.parquet")
+
+
+def list_existing_parts(parts_dir: Path) -> list[Path]:
+    if not parts_dir.exists():
+        return []
+    return sorted(parts_dir.glob("part_*.parquet"))
+
+
+def compact_rank_parts(
+    *,
+    output_prefix: str,
+    rank: int,
+    sample_key_dtype: Any,
+    answer_dtype: Any,
+    compression: str = "snappy",
+    cleanup_parts: bool = True,
+) -> Path:
+    parts_dir = part_dir_for_rank(output_prefix, rank)
+    parts = list_existing_parts(parts_dir)
+    final_path = final_output_path(output_prefix, rank)
+
+    if not parts:
+        if not final_path.exists():
+            empty_df = pl.DataFrame(
+                schema={
+                    "sample_key": sample_key_dtype,
+                    "answer": answer_dtype,
+                    "model_output": pl.Utf8,
+                    "rank": pl.Int64,
+                    "batch_idx": pl.Int64,
+                }
+            )
+            empty_df.write_parquet(final_path, compression=compression)
+        return final_path
+
+    tmp_final = final_path.with_suffix(".tmp.parquet")
+    if tmp_final.exists():
+        tmp_final.unlink()
+
+    pl.scan_parquet([str(p) for p in parts]).sink_parquet(
+        str(tmp_final),
+        compression=compression,
+    )
+    os.replace(tmp_final, final_path)
+
+    if cleanup_parts:
+        shutil.rmtree(parts_dir, ignore_errors=True)
+
+    return final_path
+
+
+def make_worker_visible_devices(rank: int, cfg: RuntimeConfig) -> str:
+    start_gpu = rank * cfg.gpus_per_worker()
+    end_gpu = start_gpu + cfg.gpus_per_worker()
+    return ",".join(str(gpu_id) for gpu_id in range(start_gpu, end_gpu))
+
+
+def worker_main(
+    rank: int,
+    shard_df: pl.DataFrame,
+    cfg: RuntimeConfig,
+    error_queue: Any,
+) -> None:
+    progress_bar: tqdm | None = None
+    try:
+        visible_devices = make_worker_visible_devices(rank, cfg)
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+        from vllm import LLM, SamplingParams  # imported after CUDA_VISIBLE_DEVICES is set
+
+        parts_dir = part_dir_for_rank(cfg.output_prefix, rank)
+        final_path = final_output_path(cfg.output_prefix, rank)
+
+        if cfg.resume and final_path.exists() and not parts_dir.exists():
+            return
+
+        if not cfg.resume and parts_dir.exists():
+            shutil.rmtree(parts_dir, ignore_errors=True)
+
+        parts_dir.mkdir(parents=True, exist_ok=True)
+
+        total_rows = shard_df.height
+        total_batches = math.ceil(total_rows / cfg.batch_size) if total_rows > 0 else 0
+
+        existing_parts = list_existing_parts(parts_dir) if cfg.resume else []
+        completed_batches = len(existing_parts)
+
+        if completed_batches > total_batches:
+            raise RuntimeError(
+                f"Rank {rank}: found {completed_batches} existing parts but shard only has "
+                f"{total_batches} batches. Delete {parts_dir} or disable --resume."
+            )
+
+        if total_batches == 0:
+            compact_rank_parts(
+                output_prefix=cfg.output_prefix,
+                rank=rank,
+                sample_key_dtype=cfg.sample_key_dtype,
+                answer_dtype=cfg.answer_dtype,
+                compression=cfg.compression,
+                cleanup_parts=cfg.cleanup_parts,
+            )
+            return
+
+        llm_kwargs: dict[str, Any] = {
+            "model": cfg.model,
+            "tensor_parallel_size": cfg.tensor_parallel_size,
+            "pipeline_parallel_size": cfg.pipeline_parallel_size,
+            "distributed_executor_backend": "mp",
+            "dtype": cfg.dtype,
+            "gpu_memory_utilization": cfg.gpu_memory_utilization,
+            "enable_prefix_caching": cfg.enable_prefix_caching,
+            "enforce_eager": cfg.enforce_eager,
+            "swap_space": cfg.swap_space,
+            "seed": cfg.seed,
+        }
+        if cfg.max_model_len is not None:
+            llm_kwargs["max_model_len"] = cfg.max_model_len
+
+        llm = LLM(**llm_kwargs)
+
+        sampling = SamplingParams(
+            temperature=cfg.temperature,
+            top_p=cfg.top_p,
+            max_tokens=cfg.max_tokens,
+        )
+
+        progress_bar = tqdm(
+            total=total_batches,
+            initial=completed_batches,
+            position=rank,
+            desc=f"rank {rank} | gpu {visible_devices}",
+            dynamic_ncols=True,
+            leave=True,
+        )
+
+        for batch_idx in range(completed_batches, total_batches):
+            start = batch_idx * cfg.batch_size
+            batch_df = shard_df.slice(start, cfg.batch_size)
+
+            conversations = build_conversations_from_batch(
+                batch_df,
+                system_prompt=cfg.system_prompt,
+            )
+            generated_texts = generate_chat_batch(
+                llm,
+                conversations,
+                sampling,
+                chat_template=cfg.chat_template,
+                chat_template_content_format=cfg.chat_template_content_format,
+                add_generation_prompt=cfg.add_generation_prompt,
+                continue_final_message=cfg.continue_final_message,
+                tools=cfg.tools,
+                return_full_outputs=False,
+            )
+
+            out_batch = build_output_batch(
+                batch_df,
+                generated_texts,
+                rank=rank,
+                batch_idx=batch_idx,
+            )
+
+            part_path = parts_dir / f"part_{batch_idx:08d}.parquet"
+            out_batch.write_parquet(part_path, compression=cfg.compression)
+
+            progress_bar.update(1)
+            progress_bar.set_postfix_str(
+                f"rows={min((batch_idx + 1) * cfg.batch_size, total_rows)}/{total_rows}",
+                refresh=False,
+            )
+
+        compact_rank_parts(
+            output_prefix=cfg.output_prefix,
+            rank=rank,
+            sample_key_dtype=cfg.sample_key_dtype,
+            answer_dtype=cfg.answer_dtype,
+            compression=cfg.compression,
+            cleanup_parts=cfg.cleanup_parts,
+        )
+
+        if progress_bar is not None:
+            progress_bar.set_postfix_str(f"done -> {final_path.name}", refresh=True)
+
+    except Exception:
+        error_queue.put(
+            {
+                "rank": rank,
+                "traceback": traceback.format_exc(),
+            }
+        )
+        raise
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+
+
+def run_inference(df: pl.DataFrame, cfg: RuntimeConfig) -> list[Path]:
+    ensure_required_columns(df)
+    df = df.rechunk()
+
+    num_workers = cfg.num_workers()
+    output_dir = final_output_path(cfg.output_prefix, 0).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    total_rows = df.height
+    shards: list[pl.DataFrame] = []
+    for rank in range(num_workers):
+        start, length = compute_shard_bounds(total_rows, num_workers, rank)
+        shards.append(df.slice(start, length))
+
+    ctx = get_context("spawn")
+    error_queue = ctx.SimpleQueue()
+
+    processes = [
+        ctx.Process(
+            target=worker_main,
+            args=(rank, shards[rank], cfg, error_queue),
+            daemon=False,
+        )
+        for rank in range(num_workers)
+    ]
+
+    for process in processes:
+        process.start()
+
+    for process in processes:
+        process.join()
+
+    if not error_queue.empty():
+        error = error_queue.get()
+        raise RuntimeError(
+            f"Worker rank {error['rank']} failed.\n\n{error['traceback']}"
+        )
+
+    failed = [proc.pid for proc in processes if proc.exitcode not in (0, None)]
+    if failed:
+        raise RuntimeError(f"Some workers failed without a captured traceback. PIDs: {failed}")
+
+    return [final_output_path(cfg.output_prefix, rank) for rank in range(num_workers)]
+
+
+def parse_tools_json(raw: str | None) -> list[dict[str, Any]] | None:
+    if raw is None:
+        return None
+    loaded = json.loads(raw)
+    if loaded is None:
+        return None
+    if not isinstance(loaded, list):
+        raise ValueError("--tools-json must decode to a JSON list or null")
+    return loaded
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Multi-process vLLM batch inference over a Polars DataFrame."
+    )
+    parser.add_argument("--input-parquet", type=str, required=True)
+    parser.add_argument("--output-prefix", type=str, required=True)
+    parser.add_argument("--model", type=str, required=True)
+
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--total-gpus", type=int, default=None)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--pipeline-parallel-size", type=int, default=1)
+
+    parser.add_argument("--dtype", type=str, default="auto")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--max-model-len", type=int, default=None)
+    parser.add_argument("--disable-prefix-caching", action="store_true")
+    parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--swap-space", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=0)
+
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--max-tokens", type=int, default=256)
+
+    parser.add_argument("--system-prompt", type=str, default="You are concise.")
+    parser.add_argument("--chat-template", type=str, default=None)
+    parser.add_argument("--chat-template-content-format", type=str, default="auto")
+    parser.add_argument("--no-add-generation-prompt", action="store_true")
+    parser.add_argument("--continue-final-message", action="store_true")
+    parser.add_argument(
+        "--tools-json",
+        type=str,
+        default=None,
+        help="JSON string containing OpenAI-style tool definitions.",
+    )
+
+    parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--keep-parts", action="store_true")
+    parser.add_argument("--compression", type=str, default="snappy")
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    total_gpus = args.total_gpus
+    if total_gpus is None:
+        total_gpus = detect_visible_gpu_count()
+        if total_gpus <= 0:
+            raise ValueError(
+                "Could not auto-detect GPUs. Pass --total-gpus explicitly."
+            )
+
+    df = pl.read_parquet(args.input_parquet)
+    ensure_required_columns(df)
+
+    cfg = RuntimeConfig(
+        model=args.model,
+        output_prefix=args.output_prefix,
+        batch_size=args.batch_size,
+        total_gpus=total_gpus,
+        sample_key_dtype=df.schema["sample_key"],
+        answer_dtype=df.schema["answer"],
+        tensor_parallel_size=args.tensor_parallel_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
+        dtype=args.dtype,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
+        enable_prefix_caching=not args.disable_prefix_caching,
+        enforce_eager=args.enforce_eager,
+        swap_space=args.swap_space,
+        seed=args.seed,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+        system_prompt=args.system_prompt,
+        chat_template=args.chat_template,
+        chat_template_content_format=args.chat_template_content_format,
+        add_generation_prompt=not args.no_add_generation_prompt,
+        continue_final_message=args.continue_final_message,
+        tools=parse_tools_json(args.tools_json),
+        resume=not args.no_resume,
+        cleanup_parts=not args.keep_parts,
+        compression=args.compression,
+    )
+
+    output_paths = run_inference(df, cfg)
+
+    print("\nFinished.")
+    print(f"Workers: {cfg.num_workers()} | GPUs per worker: {cfg.gpus_per_worker()}")
+    print("Final outputs:")
+    for path in output_paths:
+        print(f"  {path}")
+
+
+if __name__ == "__main__":
+    main()

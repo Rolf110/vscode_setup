@@ -6,7 +6,8 @@ import math
 import os
 import shutil
 import traceback
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, replace
 from multiprocessing import get_context
 from pathlib import Path
 from typing import Any, Sequence
@@ -30,42 +31,6 @@ def generate_chat_batch(
     tools: list[dict[str, Any]] | None = None,
     return_full_outputs: bool = False,
 ) -> list[str] | list[Any]:
-    """
-    Fast batch generation for OpenAI-style chat messages using vLLM.
-
-    Parameters
-    ----------
-    llm:
-        A reused vLLM LLM instance. Do not construct it inside this function.
-    conversations:
-        Batch of OpenAI-format conversations:
-        [
-          [{"role": "system", "content": "..."},
-           {"role": "user", "content": "..."}],
-          ...
-        ]
-    sampling_params:
-        vllm.SamplingParams shared by the whole batch.
-    chat_template:
-        Optional Jinja chat template override for models whose tokenizer
-        doesn't define one.
-    chat_template_content_format:
-        Usually "auto". Leave it unless your model/template expects a specific
-        content schema.
-    add_generation_prompt:
-        Usually True for normal assistant generation.
-    continue_final_message:
-        Set True only when you want the model to continue the last assistant
-        message instead of starting a new one.
-    tools:
-        Optional OpenAI-style tool definitions for tool-calling models.
-    return_full_outputs:
-        If True, return raw RequestOutput objects; otherwise return strings.
-
-    Returns
-    -------
-    list[str] or list[RequestOutput]
-    """
     if not conversations:
         return []
 
@@ -118,11 +83,6 @@ def build_output_batch(
     rank: int,
     batch_idx: int,
 ) -> pl.DataFrame:
-    """
-    Shape of a single output batch written to parquet.
-
-    Edit this if you want extra columns in the final output.
-    """
     return batch_df.select(["sample_key", "answer"]).with_columns(
         pl.Series("model_output", list(generated_texts), dtype=pl.Utf8),
         pl.lit(rank).alias("rank"),
@@ -132,12 +92,15 @@ def build_output_batch(
 
 @dataclass(frozen=True)
 class RuntimeConfig:
+    input_parquet: str
     model: str
     output_prefix: str
     batch_size: int
     total_gpus: int
+    total_rows: int
     sample_key_dtype: Any = pl.Utf8
     answer_dtype: Any = pl.Utf8
+
     tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     dtype: str = "auto"
@@ -153,7 +116,6 @@ class RuntimeConfig:
     max_tokens: int = 256
 
     system_prompt: str = "You are concise."
-
     chat_template: str | None = None
     chat_template_content_format: str = "auto"
     add_generation_prompt: bool = True
@@ -163,6 +125,7 @@ class RuntimeConfig:
     resume: bool = True
     cleanup_parts: bool = True
     compression: str = "snappy"
+    force_vllm_worker_spawn: bool = True
 
     def gpus_per_worker(self) -> int:
         return self.tensor_parallel_size * self.pipeline_parallel_size
@@ -179,11 +142,12 @@ class RuntimeConfig:
         return self.total_gpus // gpus_per_worker
 
 
-def ensure_required_columns(df: pl.DataFrame) -> None:
+def ensure_required_columns_in_schema(schema: dict[str, Any] | Any) -> None:
+    columns = set(schema.keys()) if hasattr(schema, "keys") else set(schema)
     required = {"sample_key", "answer"}
-    missing = required - set(df.columns)
+    missing = required - columns
     if missing:
-        raise ValueError(f"Input DataFrame is missing required columns: {sorted(missing)}")
+        raise ValueError(f"Input data is missing required columns: {sorted(missing)}")
 
 
 def compute_shard_bounds(total_rows: int, num_workers: int, rank: int) -> tuple[int, int]:
@@ -210,12 +174,23 @@ def detect_visible_gpu_count() -> int:
         return 0
 
 
+def read_input_metadata(input_parquet: str) -> tuple[Any, Any, int]:
+    schema_df = pl.read_parquet(input_parquet, n_rows=0)
+    ensure_required_columns_in_schema(schema_df.schema)
+    row_count = pl.read_parquet(input_parquet, columns=["sample_key"]).height
+    return schema_df.schema["sample_key"], schema_df.schema["answer"], row_count
+
+
 def part_dir_for_rank(output_prefix: str, rank: int) -> Path:
     return Path(f"{output_prefix}_{rank}.parts")
 
 
 def final_output_path(output_prefix: str, rank: int) -> Path:
     return Path(f"{output_prefix}_{rank}.parquet")
+
+
+def error_log_path(output_prefix: str, rank: int) -> Path:
+    return Path(f"{output_prefix}_{rank}.error.txt")
 
 
 def list_existing_parts(parts_dir: Path) -> list[Path]:
@@ -273,42 +248,88 @@ def make_worker_visible_devices(rank: int, cfg: RuntimeConfig) -> str:
     return ",".join(str(gpu_id) for gpu_id in range(start_gpu, end_gpu))
 
 
-def worker_main(
-    rank: int,
-    shard_df: pl.DataFrame,
-    cfg: RuntimeConfig,
-    error_queue: Any,
-) -> None:
+def read_batch_from_input(
+    input_parquet: str,
+    *,
+    global_start: int,
+    batch_size: int,
+) -> pl.DataFrame:
+    # Read only the required columns for the current batch.
+    return (
+        pl.scan_parquet(input_parquet)
+        .slice(global_start, batch_size)
+        .select(["sample_key", "answer"])
+        .collect()
+    )
+
+
+def build_llm_kwargs(cfg: RuntimeConfig) -> dict[str, Any]:
+    llm_kwargs: dict[str, Any] = {
+        "model": cfg.model,
+        "tensor_parallel_size": cfg.tensor_parallel_size,
+        "pipeline_parallel_size": cfg.pipeline_parallel_size,
+        "dtype": cfg.dtype,
+        "gpu_memory_utilization": cfg.gpu_memory_utilization,
+        "enable_prefix_caching": cfg.enable_prefix_caching,
+        "enforce_eager": cfg.enforce_eager,
+        "swap_space": cfg.swap_space,
+        "seed": cfg.seed,
+    }
+    if cfg.max_model_len is not None:
+        llm_kwargs["max_model_len"] = cfg.max_model_len
+
+    # Only force a distributed backend when a worker actually owns >1 GPU.
+    # For the common single-GPU-per-worker case, leave the executor default alone.
+    if cfg.gpus_per_worker() > 1:
+        llm_kwargs["distributed_executor_backend"] = "mp"
+
+    return llm_kwargs
+
+
+def worker_main(rank: int, cfg: RuntimeConfig) -> None:
     progress_bar: tqdm | None = None
+    err_path = error_log_path(cfg.output_prefix, rank)
+    if err_path.exists():
+        err_path.unlink()
+
     try:
         visible_devices = make_worker_visible_devices(rank, cfg)
         os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        if cfg.force_vllm_worker_spawn:
+            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-        from vllm import LLM, SamplingParams  # imported after CUDA_VISIBLE_DEVICES is set
+        shard_start, shard_len = compute_shard_bounds(cfg.total_rows, cfg.num_workers(), rank)
+        total_batches = math.ceil(shard_len / cfg.batch_size) if shard_len > 0 else 0
 
         parts_dir = part_dir_for_rank(cfg.output_prefix, rank)
         final_path = final_output_path(cfg.output_prefix, rank)
 
         if cfg.resume and final_path.exists() and not parts_dir.exists():
+            print(f"[rank {rank}] already finished: {final_path}", flush=True)
             return
 
         if not cfg.resume and parts_dir.exists():
             shutil.rmtree(parts_dir, ignore_errors=True)
-
         parts_dir.mkdir(parents=True, exist_ok=True)
-
-        total_rows = shard_df.height
-        total_batches = math.ceil(total_rows / cfg.batch_size) if total_rows > 0 else 0
 
         existing_parts = list_existing_parts(parts_dir) if cfg.resume else []
         completed_batches = len(existing_parts)
-
         if completed_batches > total_batches:
             raise RuntimeError(
                 f"Rank {rank}: found {completed_batches} existing parts but shard only has "
                 f"{total_batches} batches. Delete {parts_dir} or disable --resume."
             )
+
+        progress_bar = tqdm(
+            total=total_batches,
+            initial=completed_batches,
+            position=rank,
+            desc=f"rank {rank} | gpu {visible_devices}",
+            dynamic_ncols=True,
+            leave=True,
+        )
+        progress_bar.set_postfix_str("starting", refresh=True)
 
         if total_batches == 0:
             compact_rank_parts(
@@ -319,43 +340,30 @@ def worker_main(
                 compression=cfg.compression,
                 cleanup_parts=cfg.cleanup_parts,
             )
+            progress_bar.set_postfix_str("empty shard", refresh=True)
             return
 
-        llm_kwargs: dict[str, Any] = {
-            "model": cfg.model,
-            "tensor_parallel_size": cfg.tensor_parallel_size,
-            "pipeline_parallel_size": cfg.pipeline_parallel_size,
-            "distributed_executor_backend": "mp",
-            "dtype": cfg.dtype,
-            "gpu_memory_utilization": cfg.gpu_memory_utilization,
-            "enable_prefix_caching": cfg.enable_prefix_caching,
-            "enforce_eager": cfg.enforce_eager,
-            "swap_space": cfg.swap_space,
-            "seed": cfg.seed,
-        }
-        if cfg.max_model_len is not None:
-            llm_kwargs["max_model_len"] = cfg.max_model_len
+        progress_bar.set_postfix_str("loading model", refresh=True)
+        from vllm import LLM, SamplingParams
 
-        llm = LLM(**llm_kwargs)
-
+        llm = LLM(**build_llm_kwargs(cfg))
         sampling = SamplingParams(
             temperature=cfg.temperature,
             top_p=cfg.top_p,
             max_tokens=cfg.max_tokens,
         )
-
-        progress_bar = tqdm(
-            total=total_batches,
-            initial=completed_batches,
-            position=rank,
-            desc=f"rank {rank} | gpu {visible_devices}",
-            dynamic_ncols=True,
-            leave=True,
-        )
+        progress_bar.set_postfix_str("running", refresh=True)
 
         for batch_idx in range(completed_batches, total_batches):
-            start = batch_idx * cfg.batch_size
-            batch_df = shard_df.slice(start, cfg.batch_size)
+            global_start = shard_start + batch_idx * cfg.batch_size
+            batch_df = read_batch_from_input(
+                cfg.input_parquet,
+                global_start=global_start,
+                batch_size=cfg.batch_size,
+            )
+
+            if batch_df.is_empty():
+                break
 
             conversations = build_conversations_from_batch(
                 batch_df,
@@ -381,13 +389,15 @@ def worker_main(
             )
 
             part_path = parts_dir / f"part_{batch_idx:08d}.parquet"
-            out_batch.write_parquet(part_path, compression=cfg.compression)
+            tmp_part_path = part_path.with_suffix(".tmp.parquet")
+            if tmp_part_path.exists():
+                tmp_part_path.unlink()
+            out_batch.write_parquet(tmp_part_path, compression=cfg.compression)
+            os.replace(tmp_part_path, part_path)
 
             progress_bar.update(1)
-            progress_bar.set_postfix_str(
-                f"rows={min((batch_idx + 1) * cfg.batch_size, total_rows)}/{total_rows}",
-                refresh=False,
-            )
+            done_rows = min((batch_idx + 1) * cfg.batch_size, shard_len)
+            progress_bar.set_postfix_str(f"rows={done_rows}/{shard_len}", refresh=False)
 
         compact_rank_parts(
             output_prefix=cfg.output_prefix,
@@ -397,44 +407,35 @@ def worker_main(
             compression=cfg.compression,
             cleanup_parts=cfg.cleanup_parts,
         )
-
-        if progress_bar is not None:
-            progress_bar.set_postfix_str(f"done -> {final_path.name}", refresh=True)
+        progress_bar.set_postfix_str(f"done -> {final_path.name}", refresh=True)
 
     except Exception:
-        error_queue.put(
-            {
-                "rank": rank,
-                "traceback": traceback.format_exc(),
-            }
-        )
+        err_path.write_text(traceback.format_exc(), encoding="utf-8")
         raise
     finally:
         if progress_bar is not None:
             progress_bar.close()
 
 
-def run_inference(df: pl.DataFrame, cfg: RuntimeConfig) -> list[Path]:
-    ensure_required_columns(df)
-    df = df.rechunk()
+def collect_worker_errors(cfg: RuntimeConfig) -> list[tuple[int, str]]:
+    errors: list[tuple[int, str]] = []
+    for rank in range(cfg.num_workers()):
+        err_path = error_log_path(cfg.output_prefix, rank)
+        if err_path.exists():
+            errors.append((rank, err_path.read_text(encoding="utf-8")))
+    return errors
 
+
+def run_inference_from_parquet(cfg: RuntimeConfig) -> list[Path]:
     num_workers = cfg.num_workers()
     output_dir = final_output_path(cfg.output_prefix, 0).parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    total_rows = df.height
-    shards: list[pl.DataFrame] = []
-    for rank in range(num_workers):
-        start, length = compute_shard_bounds(total_rows, num_workers, rank)
-        shards.append(df.slice(start, length))
-
     ctx = get_context("spawn")
-    error_queue = ctx.SimpleQueue()
-
     processes = [
         ctx.Process(
             target=worker_main,
-            args=(rank, shards[rank], cfg, error_queue),
+            args=(rank, cfg),
             daemon=False,
         )
         for rank in range(num_workers)
@@ -446,17 +447,96 @@ def run_inference(df: pl.DataFrame, cfg: RuntimeConfig) -> list[Path]:
     for process in processes:
         process.join()
 
-    if not error_queue.empty():
-        error = error_queue.get()
+    failed = [proc for proc in processes if proc.exitcode not in (0, None)]
+    if failed:
+        errors = collect_worker_errors(cfg)
+        if errors:
+            msg = "\n\n".join(
+                f"Worker rank {rank} failed:\n{trace}" for rank, trace in errors
+            )
+            raise RuntimeError(msg)
         raise RuntimeError(
-            f"Worker rank {error['rank']} failed.\n\n{error['traceback']}"
+            "Some workers failed without a traceback file. "
+            f"Exit codes: {[proc.exitcode for proc in failed]}"
         )
 
-    failed = [proc.pid for proc in processes if proc.exitcode not in (0, None)]
-    if failed:
-        raise RuntimeError(f"Some workers failed without a captured traceback. PIDs: {failed}")
-
     return [final_output_path(cfg.output_prefix, rank) for rank in range(num_workers)]
+
+
+def run_inference_from_dataframe(
+    df: pl.DataFrame,
+    *,
+    model: str,
+    output_prefix: str,
+    batch_size: int,
+    total_gpus: int,
+    tensor_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+    dtype: str = "auto",
+    gpu_memory_utilization: float = 0.90,
+    max_model_len: int | None = None,
+    enable_prefix_caching: bool = True,
+    enforce_eager: bool = False,
+    swap_space: int = 4,
+    seed: int = 0,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    max_tokens: int = 256,
+    system_prompt: str = "You are concise.",
+    chat_template: str | None = None,
+    chat_template_content_format: str = "auto",
+    add_generation_prompt: bool = True,
+    continue_final_message: bool = False,
+    tools: list[dict[str, Any]] | None = None,
+    resume: bool = True,
+    cleanup_parts: bool = True,
+    compression: str = "snappy",
+    temp_input_dir: str | None = None,
+    cleanup_temp_input: bool = True,
+) -> list[Path]:
+    ensure_required_columns_in_schema(df.schema)
+    input_dir = Path(temp_input_dir) if temp_input_dir is not None else Path.cwd()
+    input_dir.mkdir(parents=True, exist_ok=True)
+    temp_input_path = input_dir / f"vllm_input_{uuid.uuid4().hex}.parquet"
+    df.select(["sample_key", "answer"]).write_parquet(temp_input_path, compression=compression)
+
+    cfg = RuntimeConfig(
+        input_parquet=str(temp_input_path),
+        model=model,
+        output_prefix=output_prefix,
+        batch_size=batch_size,
+        total_gpus=total_gpus,
+        total_rows=df.height,
+        sample_key_dtype=df.schema["sample_key"],
+        answer_dtype=df.schema["answer"],
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        dtype=dtype,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
+        enable_prefix_caching=enable_prefix_caching,
+        enforce_eager=enforce_eager,
+        swap_space=swap_space,
+        seed=seed,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        system_prompt=system_prompt,
+        chat_template=chat_template,
+        chat_template_content_format=chat_template_content_format,
+        add_generation_prompt=add_generation_prompt,
+        continue_final_message=continue_final_message,
+        tools=tools,
+        resume=resume,
+        cleanup_parts=cleanup_parts,
+        compression=compression,
+    )
+
+    try:
+        return run_inference_from_parquet(cfg)
+    finally:
+        if cleanup_temp_input:
+            temp_input_path.unlink(missing_ok=True)
 
 
 def parse_tools_json(raw: str | None) -> list[dict[str, Any]] | None:
@@ -472,7 +552,7 @@ def parse_tools_json(raw: str | None) -> list[dict[str, Any]] | None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Multi-process vLLM batch inference over a Polars DataFrame."
+        description="Multi-process vLLM batch inference over a Polars dataset."
     )
     parser.add_argument("--input-parquet", type=str, required=True)
     parser.add_argument("--output-prefix", type=str, required=True)
@@ -510,6 +590,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--keep-parts", action="store_true")
     parser.add_argument("--compression", type=str, default="snappy")
+    parser.add_argument("--no-force-vllm-worker-spawn", action="store_true")
 
     return parser.parse_args()
 
@@ -521,20 +602,19 @@ def main() -> None:
     if total_gpus is None:
         total_gpus = detect_visible_gpu_count()
         if total_gpus <= 0:
-            raise ValueError(
-                "Could not auto-detect GPUs. Pass --total-gpus explicitly."
-            )
+            raise ValueError("Could not auto-detect GPUs. Pass --total-gpus explicitly.")
 
-    df = pl.read_parquet(args.input_parquet)
-    ensure_required_columns(df)
+    sample_key_dtype, answer_dtype, total_rows = read_input_metadata(args.input_parquet)
 
     cfg = RuntimeConfig(
+        input_parquet=args.input_parquet,
         model=args.model,
         output_prefix=args.output_prefix,
         batch_size=args.batch_size,
         total_gpus=total_gpus,
-        sample_key_dtype=df.schema["sample_key"],
-        answer_dtype=df.schema["answer"],
+        total_rows=total_rows,
+        sample_key_dtype=sample_key_dtype,
+        answer_dtype=answer_dtype,
         tensor_parallel_size=args.tensor_parallel_size,
         pipeline_parallel_size=args.pipeline_parallel_size,
         dtype=args.dtype,
@@ -556,9 +636,10 @@ def main() -> None:
         resume=not args.no_resume,
         cleanup_parts=not args.keep_parts,
         compression=args.compression,
+        force_vllm_worker_spawn=not args.no_force_vllm_worker_spawn,
     )
 
-    output_paths = run_inference(df, cfg)
+    output_paths = run_inference_from_parquet(cfg)
 
     print("\nFinished.")
     print(f"Workers: {cfg.num_workers()} | GPUs per worker: {cfg.gpus_per_worker()}")

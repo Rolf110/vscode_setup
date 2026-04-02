@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import signal
+import time
+from multiprocessing import Event, Process
+
+import torch
+
+
+def worker(rank: int, args, stop_event: Event) -> None:
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+
+    if args.dtype == "float16":
+        dtype = torch.float16
+    elif args.dtype == "bfloat16":
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float32
+
+    # Good defaults for A100 matmul throughput.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+    # Optional: use multiple CUDA streams per GPU to keep work queued.
+    streams = [torch.cuda.Stream(device=device) for _ in range(args.streams)]
+
+    # Pre-allocate matrices once, then refill in-place each iteration.
+    mats = []
+    for _ in range(args.streams):
+        a = torch.empty((args.dim, args.dim), device=device, dtype=dtype)
+        b = torch.empty((args.dim, args.dim), device=device, dtype=dtype)
+        c = torch.empty((args.dim, args.dim), device=device, dtype=dtype)
+        mats.append((a, b, c))
+
+    torch.cuda.synchronize(device)
+    start = time.time()
+    iters = 0
+
+    while not stop_event.is_set():
+        for stream, (a, b, c) in zip(streams, mats):
+            with torch.cuda.stream(stream):
+                # Refill with fresh random data each cycle.
+                a.normal_(0, 1)
+                b.normal_(0, 1)
+                torch.matmul(a, b, out=c)
+
+                # Small dependency to prevent aggressive dead-code elimination.
+                if args.touch_output:
+                    c.view(-1)[0].add_(1)
+
+        # Periodically sync so the queue does not grow unbounded and stats are meaningful.
+        if (iters + 1) % args.sync_every == 0:
+            torch.cuda.synchronize(device)
+
+        iters += 1
+
+        if args.log_every > 0 and iters % args.log_every == 0:
+            torch.cuda.synchronize(device)
+            elapsed = time.time() - start
+            print(
+                f"[GPU {rank}] iterations={iters} elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+
+    torch.cuda.synchronize(device)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gpus", type=int, default=8, help="Number of GPUs to use")
+    parser.add_argument(
+        "--dim",
+        type=int,
+        default=32768,
+        help="Matrix dimension N for NxN @ NxN. Reduce if you hit OOM.",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=["float16", "bfloat16", "float32"],
+        default="bfloat16",
+        help="A100 usually performs very well with bfloat16",
+    )
+    parser.add_argument(
+        "--streams",
+        type=int,
+        default=1,
+        help="CUDA streams per GPU",
+    )
+    parser.add_argument(
+        "--sync-every",
+        type=int,
+        default=10,
+        help="Synchronize every N iterations",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=50,
+        help="Print status every N iterations per GPU; 0 disables logging",
+    )
+    parser.add_argument(
+        "--touch-output",
+        action="store_true",
+        help="Touch output tensor to keep a dependency on results",
+    )
+    args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available.")
+
+    visible = torch.cuda.device_count()
+    if visible < args.gpus:
+        raise RuntimeError(
+            f"Requested {args.gpus} GPUs, but only {visible} visible via CUDA."
+        )
+
+    stop_event = Event()
+    procs = []
+
+    def handle_signal(signum, frame):
+        del signum, frame
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    print(
+        f"Starting burn on {args.gpus} GPUs | dim={args.dim} | dtype={args.dtype} | streams={args.streams}",
+        flush=True,
+    )
+
+    for rank in range(args.gpus):
+        p = Process(target=worker, args=(rank, args, stop_event), daemon=False)
+        p.start()
+        procs.append(p)
+
+    try:
+        while any(p.is_alive() for p in procs):
+            time.sleep(1)
+    except KeyboardInterrupt:
+        stop_event.set()
+    finally:
+        stop_event.set()
+        for p in procs:
+            p.join()
+
+
+if __name__ == "__main__":
+    # Safer for CUDA multiprocessing
+    torch.multiprocessing.set_start_method("spawn", force=True)
+    main()

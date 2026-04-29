@@ -4,36 +4,48 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 
-def plot_monthly_spending_donuts(
-    df: pd.DataFrame,
+def plot_monthly_spending_with_apps(
+    spend_df: pd.DataFrame,
+    apps_df: pd.DataFrame | None = None,
     category_col: str = "operation type",
-    date_col: str = "local_date",
-    amount_col: str = "tatal_amount",   # change if needed
+    spend_date_col: str = "local_date",
+    amount_col: str = "tatal_amount",   # rename if needed
     events_col: str = "n_events",
+    app_date_col: str = "app_dt",
+    app_product_col: str = "product",
+    app_subproduct_col: str = "subproduct",
+    app_status_col: str = "app_status",
+    app_term_col: str = "term",
+    app_client_group_col: str = "client_group",
+    app_amount_col: str = "amount",
     max_cols: int = 6,
     hole: float = 0.58,
     use_abs: bool = True,
     title: str = "Monthly spending by category",
     category_colors: dict | None = None,
+    show_zero_app_block: bool = False,
 ):
-    d = df.copy()
+    # ---------------------------
+    # 1. Prepare spending data
+    # ---------------------------
+    d = spend_df.copy()
 
-    required = [category_col, date_col, amount_col, events_col]
-    missing = [c for c in required if c not in d.columns]
-    if missing:
-        raise ValueError(f"Missing columns: {missing}")
+    required_spend = [category_col, spend_date_col, amount_col, events_col]
+    missing_spend = [c for c in required_spend if c not in d.columns]
+    if missing_spend:
+        raise ValueError(f"Missing spending columns: {missing_spend}")
 
     d[category_col] = d[category_col].fillna("Unknown").astype(str)
-    d[date_col] = pd.to_datetime(d[date_col])
+    d[spend_date_col] = pd.to_datetime(d[spend_date_col])
     d[amount_col] = pd.to_numeric(d[amount_col], errors="coerce").fillna(0)
     d[events_col] = pd.to_numeric(d[events_col], errors="coerce").fillna(0)
 
     if use_abs:
         d[amount_col] = d[amount_col].abs()
 
-    d["month"] = d[date_col].dt.to_period("M").dt.to_timestamp()
+    d["month"] = d[spend_date_col].dt.to_period("M").dt.to_timestamp()
 
-    g = (
+    g_spend = (
         d.groupby(["month", category_col], as_index=False)
         .agg(
             amount=(amount_col, "sum"),
@@ -41,23 +53,107 @@ def plot_monthly_spending_donuts(
         )
     )
 
-    g = g[g["amount"] >= 0]
+    g_spend = g_spend[g_spend["amount"] >= 0]
 
-    if g.empty:
-        raise ValueError("No data to plot.")
+    if g_spend.empty:
+        raise ValueError("No spending data to plot.")
 
-    months = sorted(g["month"].unique())
+    spend_months = sorted(g_spend["month"].unique())
 
-    # Global category order across all months
     category_order = (
-        g.groupby(category_col)["amount"]
+        g_spend.groupby(category_col)["amount"]
         .sum()
         .sort_values(ascending=False)
         .index
         .tolist()
     )
 
-    # Default palette
+    # ---------------------------
+    # 2. Prepare application data
+    # ---------------------------
+    apps_summary = pd.DataFrame(columns=["month", "n_apps", "apps_amount_sum", "hover_html"])
+
+    if apps_df is not None and len(apps_df) > 0:
+        a = apps_df.copy()
+
+        required_apps = [
+            app_date_col,
+            app_product_col,
+            app_subproduct_col,
+            app_status_col,
+            app_term_col,
+            app_client_group_col,
+            app_amount_col,
+        ]
+        missing_apps = [c for c in required_apps if c not in a.columns]
+        if missing_apps:
+            raise ValueError(f"Missing application columns: {missing_apps}")
+
+        a[app_date_col] = pd.to_datetime(a[app_date_col])
+        a[app_amount_col] = pd.to_numeric(a[app_amount_col], errors="coerce").fillna(0)
+        a[app_term_col] = pd.to_numeric(a[app_term_col], errors="coerce")
+
+        a[app_product_col] = a[app_product_col].fillna("").astype(str)
+        a[app_subproduct_col] = a[app_subproduct_col].fillna("").astype(str)
+        a[app_status_col] = a[app_status_col].fillna("").astype(str)
+        a[app_client_group_col] = a[app_client_group_col].fillna("").astype(str)
+
+        a["month"] = a[app_date_col].dt.to_period("M").dt.to_timestamp()
+
+        # Concatenate product + subproduct
+        a["product_full"] = (
+            a[app_product_col].str.strip()
+            + a[app_subproduct_col].map(lambda x: f" / {x.strip()}" if x.strip() else "")
+        )
+
+        def build_hover_html(group: pd.DataFrame) -> str:
+            lines = [
+                f"<b>{pd.Timestamp(group['month'].iloc[0]).strftime('%m %Y')}</b>",
+                f"Applications: {len(group)}",
+                f"Total amount: {group[app_amount_col].sum():,.0f}",
+                "<br><b>Applications details</b>"
+            ]
+
+            for idx, (_, row) in enumerate(group.iterrows(), start=1):
+                term_val = "" if pd.isna(row[app_term_col]) else f"{row[app_term_col]:,.0f}"
+                app_dt_str = pd.Timestamp(row[app_date_col]).strftime("%d.%m.%Y")
+
+                lines.extend([
+                    f"<br><b>Application {idx}</b>",
+                    f"Date: {app_dt_str}",
+                    f"Product: {row['product_full'] or '-'}",
+                    f"Status: {row[app_status_col] or '-'}",
+                    f"Term: {term_val or '-'}",
+                    f"Client group: {row[app_client_group_col] or '-'}",
+                    f"Amount: {row[app_amount_col]:,.0f}",
+                ])
+
+            return "<br>".join(lines)
+
+        apps_summary = (
+            a.groupby("month", as_index=False)
+             .agg(
+                 n_apps=(app_amount_col, "size"),
+                 apps_amount_sum=(app_amount_col, "sum"),
+             )
+        )
+
+        hover_map = (
+            a.groupby("month")
+             .apply(build_hover_html)
+             .to_dict()
+        )
+
+        apps_summary["hover_html"] = apps_summary["month"].map(hover_map)
+
+    # union of months from spending and apps
+    all_months = sorted(set(spend_months) | set(apps_summary["month"].tolist() if len(apps_summary) else []))
+    if not all_months:
+        raise ValueError("No months found.")
+
+    # ---------------------------
+    # 3. Colors
+    # ---------------------------
     default_palette = (
         px.colors.qualitative.Safe
         + px.colors.qualitative.Set3
@@ -65,7 +161,6 @@ def plot_monthly_spending_donuts(
         + px.colors.qualitative.Bold
     )
 
-    # Fixed colors for categories across all donuts
     if category_colors is None:
         category_colors = {}
 
@@ -78,19 +173,26 @@ def plot_monthly_spending_donuts(
             color_map[cat] = default_palette[palette_idx % len(default_palette)]
             palette_idx += 1
 
-    n_months = len(months)
+    # ---------------------------
+    # 4. Layout grid
+    # ---------------------------
+    n_months = len(all_months)
     ncols = min(max_cols, n_months)
     nrows = math.ceil(n_months / ncols)
 
     fig = go.Figure()
 
-    # Layout paddings within each cell
+    # invisible Cartesian axes for app blocks
+    fig.update_xaxes(visible=False, range=[0, 1], fixedrange=True)
+    fig.update_yaxes(visible=False, range=[0, 1], fixedrange=True)
+
+    # paddings inside each cell
     left_pad = 0.08
     right_pad = 0.08
-    top_pad = 0.06
+    top_pad_for_app = 0.22
     bottom_pad = 0.22
 
-    for i, month in enumerate(months):
+    for i, month in enumerate(all_months):
         row = i // ncols
         col = i % ncols
 
@@ -100,29 +202,30 @@ def plot_monthly_spending_donuts(
         cell_x0 = col * cell_w
         cell_x1 = (col + 1) * cell_w
 
-        # paper coordinates: top=1, bottom=0
+        # paper coordinates
         cell_y1 = 1.0 - row * cell_h
         cell_y0 = 1.0 - (row + 1) * cell_h
 
+        # Donut domain leaves room above for app block
         x0 = cell_x0 + cell_w * left_pad
         x1 = cell_x1 - cell_w * right_pad
         y0 = cell_y0 + cell_h * bottom_pad
-        y1 = cell_y1 - cell_h * top_pad
+        y1 = cell_y1 - cell_h * top_pad_for_app
 
         x_center = (x0 + x1) / 2
         y_center = (y0 + y1) / 2
+        month_label = pd.Timestamp(month).strftime("%m %Y")
 
-        month_df = g[g["month"] == month].set_index(category_col)
+        # ---------------------------
+        # Spending donut
+        # ---------------------------
+        month_df = g_spend[g_spend["month"] == month].set_index(category_col)
 
-        # IMPORTANT:
-        # keep the same labels and same order for every month
-        # missing categories get 0
         labels = category_order
         values = [float(month_df.loc[c, "amount"]) if c in month_df.index else 0.0 for c in labels]
         events = [int(month_df.loc[c, "events"]) if c in month_df.index else 0 for c in labels]
 
-        total = sum(values)
-        month_label = pd.Timestamp(month).strftime("%m %Y")
+        total_spend = sum(values)
 
         fig.add_trace(
             go.Pie(
@@ -137,7 +240,7 @@ def plot_monthly_spending_donuts(
                     colors=[color_map[c] for c in labels],
                     line=dict(color="white", width=2),
                 ),
-                textinfo="none",   # no text inside slices
+                textinfo="none",
                 customdata=events,
                 hovertemplate=(
                     "<b>%{label}</b><br>"
@@ -146,21 +249,18 @@ def plot_monthly_spending_donuts(
                     "Events: %{customdata}<br>"
                     "Share: %{percent}<extra></extra>"
                 ),
-                # Show legend only once, from the first donut
-                # Since this donut contains ALL categories (including zeros),
-                # the legend will contain all categories and remain interactive.
                 showlegend=(i == 0),
                 legendgroup="spending_categories",
             )
         )
 
-        # total in donut center
+        # total spend in center
         fig.add_annotation(
             x=x_center,
             y=y_center,
             xref="paper",
             yref="paper",
-            text=f"{total:,.0f}",
+            text=f"{total_spend:,.0f}",
             showarrow=False,
             xanchor="center",
             yanchor="middle",
@@ -168,10 +268,10 @@ def plot_monthly_spending_donuts(
             align="center",
         )
 
-        # month under donut
+        # month label under donut
         fig.add_annotation(
             x=x_center,
-            y=cell_y0 + cell_h * 0.08,
+            y=cell_y0 + cell_h * 0.07,
             xref="paper",
             yref="paper",
             text=month_label,
@@ -182,11 +282,63 @@ def plot_monthly_spending_donuts(
             align="center",
         )
 
+        # ---------------------------
+        # Application block above donut
+        # ---------------------------
+        app_row = apps_summary[apps_summary["month"] == month]
+
+        if len(app_row) > 0:
+            n_apps = int(app_row["n_apps"].iloc[0])
+            app_sum = float(app_row["apps_amount_sum"].iloc[0])
+            hover_html = app_row["hover_html"].iloc[0]
+
+            block_text = f"{n_apps} app{'s' if n_apps != 1 else ''}<br>{app_sum:,.0f}"
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[x_center],
+                    y=[cell_y1 - cell_h * 0.08],
+                    mode="markers+text",
+                    text=[block_text],
+                    textposition="middle center",
+                    textfont=dict(size=11, color="white"),
+                    marker=dict(
+                        symbol="square",
+                        size=58,
+                        color="#5B6C8F",
+                        line=dict(color="white", width=1.5),
+                    ),
+                    hovertemplate="%{customdata}<extra></extra>",
+                    customdata=[hover_html],
+                    showlegend=False,
+                )
+            )
+
+        elif show_zero_app_block:
+            fig.add_trace(
+                go.Scatter(
+                    x=[x_center],
+                    y=[cell_y1 - cell_h * 0.08],
+                    mode="markers+text",
+                    text=["0 apps<br>0"],
+                    textposition="middle center",
+                    textfont=dict(size=11, color="white"),
+                    marker=dict(
+                        symbol="square",
+                        size=58,
+                        color="#B8BFCC",
+                        line=dict(color="white", width=1.5),
+                    ),
+                    hovertemplate="No applications<extra></extra>",
+                    showlegend=False,
+                )
+            )
+
     fig.update_layout(
         title=title,
         template="plotly_white",
-        width=max(420, 250 * ncols + 180),
-        height=max(320, 290 * nrows + 40),
+        width=max(450, 260 * ncols + 180),
+        height=max(360, 320 * nrows + 40),
         margin=dict(l=20, r=180, t=70, b=30),
         legend=dict(
             title="Category",
@@ -195,6 +347,7 @@ def plot_monthly_spending_donuts(
             xanchor="left",
             yanchor="top",
         ),
+        hoverlabel=dict(align="left"),
     )
 
     return fig

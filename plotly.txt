@@ -8,12 +8,13 @@ def plot_monthly_spending_donuts(
     df: pd.DataFrame,
     category_col: str = "operation type",
     date_col: str = "local_date",
-    amount_col: str = "tatal_amount",   # rename if needed
+    amount_col: str = "tatal_amount",   # change if needed
     events_col: str = "n_events",
     max_cols: int = 6,
     hole: float = 0.58,
     use_abs: bool = True,
     title: str = "Monthly spending by category",
+    category_colors: dict | None = None,
 ):
     d = df.copy()
 
@@ -40,14 +41,14 @@ def plot_monthly_spending_donuts(
         )
     )
 
-    g = g[g["amount"] > 0]
+    g = g[g["amount"] >= 0]
 
     if g.empty:
-        raise ValueError("No positive spending data found.")
+        raise ValueError("No data to plot.")
 
     months = sorted(g["month"].unique())
 
-    # All categories across all months
+    # Global category order across all months
     category_order = (
         g.groupby(category_col)["amount"]
         .sum()
@@ -56,16 +57,26 @@ def plot_monthly_spending_donuts(
         .tolist()
     )
 
-    palette = (
+    # Default palette
+    default_palette = (
         px.colors.qualitative.Safe
         + px.colors.qualitative.Set3
         + px.colors.qualitative.Pastel
         + px.colors.qualitative.Bold
     )
-    color_map = {
-        cat: palette[i % len(palette)]
-        for i, cat in enumerate(category_order)
-    }
+
+    # Fixed colors for categories across all donuts
+    if category_colors is None:
+        category_colors = {}
+
+    color_map = {}
+    palette_idx = 0
+    for cat in category_order:
+        if cat in category_colors:
+            color_map[cat] = category_colors[cat]
+        else:
+            color_map[cat] = default_palette[palette_idx % len(default_palette)]
+            palette_idx += 1
 
     n_months = len(months)
     ncols = min(max_cols, n_months)
@@ -73,23 +84,7 @@ def plot_monthly_spending_donuts(
 
     fig = go.Figure()
 
-    # -------- Add a separate legend (important fix) --------
-    # One dummy trace per category so legend always shows all categories
-    for cat in category_order:
-        fig.add_trace(
-            go.Scatter(
-                x=[None],
-                y=[None],
-                mode="markers",
-                marker=dict(size=10, color=color_map[cat]),
-                name=cat,
-                showlegend=True,
-                hoverinfo="skip",
-                legendgroup=f"legend_{cat}",
-            )
-        )
-
-    # Layout paddings inside each cell
+    # Layout paddings within each cell
     left_pad = 0.08
     right_pad = 0.08
     top_pad = 0.06
@@ -119,18 +114,12 @@ def plot_monthly_spending_donuts(
 
         month_df = g[g["month"] == month].set_index(category_col)
 
-        labels = []
-        values = []
-        events = []
-
-        for cat in category_order:
-            if cat in month_df.index:
-                val = float(month_df.loc[cat, "amount"])
-                ev = int(month_df.loc[cat, "events"])
-                if val > 0:
-                    labels.append(cat)
-                    values.append(val)
-                    events.append(ev)
+        # IMPORTANT:
+        # keep the same labels and same order for every month
+        # missing categories get 0
+        labels = category_order
+        values = [float(month_df.loc[c, "amount"]) if c in month_df.index else 0.0 for c in labels]
+        events = [int(month_df.loc[c, "events"]) if c in month_df.index else 0 for c in labels]
 
         total = sum(values)
         month_label = pd.Timestamp(month).strftime("%m %Y")
@@ -148,7 +137,8 @@ def plot_monthly_spending_donuts(
                     colors=[color_map[c] for c in labels],
                     line=dict(color="white", width=2),
                 ),
-                textinfo="none",   # no labels inside slices
+                textinfo="none",   # no text inside slices
+                customdata=events,
                 hovertemplate=(
                     "<b>%{label}</b><br>"
                     f"Month: {month_label}<br>"
@@ -156,12 +146,15 @@ def plot_monthly_spending_donuts(
                     "Events: %{customdata}<br>"
                     "Share: %{percent}<extra></extra>"
                 ),
-                customdata=events,
-                showlegend=False,  # legend handled by dummy scatter traces
+                # Show legend only once, from the first donut
+                # Since this donut contains ALL categories (including zeros),
+                # the legend will contain all categories and remain interactive.
+                showlegend=(i == 0),
+                legendgroup="spending_categories",
             )
         )
 
-        # total in center
+        # total in donut center
         fig.add_annotation(
             x=x_center,
             y=y_center,
@@ -175,7 +168,7 @@ def plot_monthly_spending_donuts(
             align="center",
         )
 
-        # month label under donut
+        # month under donut
         fig.add_annotation(
             x=x_center,
             y=cell_y0 + cell_h * 0.08,
@@ -202,9 +195,6 @@ def plot_monthly_spending_donuts(
             xanchor="left",
             yanchor="top",
         ),
-        # hide axes from dummy scatter traces
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
     )
 
     return fig

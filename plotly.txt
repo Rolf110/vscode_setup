@@ -8,7 +8,7 @@ def plot_monthly_spending_donuts(
     df: pd.DataFrame,
     category_col: str = "operation type",
     date_col: str = "local_date",
-    amount_col: str = "tatal_amount",   # change if your real column is total_amount
+    amount_col: str = "tatal_amount",   # rename if needed
     events_col: str = "n_events",
     max_cols: int = 6,
     hole: float = 0.58,
@@ -30,7 +30,6 @@ def plot_monthly_spending_donuts(
     if use_abs:
         d[amount_col] = d[amount_col].abs()
 
-    # Normalize to month start just in case
     d["month"] = d[date_col].dt.to_period("M").dt.to_timestamp()
 
     g = (
@@ -43,10 +42,12 @@ def plot_monthly_spending_donuts(
 
     g = g[g["amount"] > 0]
 
-    months = sorted(g["month"].unique())
-    if len(months) == 0:
+    if g.empty:
         raise ValueError("No positive spending data found.")
 
+    months = sorted(g["month"].unique())
+
+    # All categories across all months
     category_order = (
         g.groupby(category_col)["amount"]
         .sum()
@@ -72,11 +73,27 @@ def plot_monthly_spending_donuts(
 
     fig = go.Figure()
 
-    # padding inside each grid cell
+    # -------- Add a separate legend (important fix) --------
+    # One dummy trace per category so legend always shows all categories
+    for cat in category_order:
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker=dict(size=10, color=color_map[cat]),
+                name=cat,
+                showlegend=True,
+                hoverinfo="skip",
+                legendgroup=f"legend_{cat}",
+            )
+        )
+
+    # Layout paddings inside each cell
     left_pad = 0.08
     right_pad = 0.08
     top_pad = 0.06
-    bottom_pad = 0.22   # reserve more space for month label
+    bottom_pad = 0.22
 
     for i, month in enumerate(months):
         row = i // ncols
@@ -88,11 +105,10 @@ def plot_monthly_spending_donuts(
         cell_x0 = col * cell_w
         cell_x1 = (col + 1) * cell_w
 
-        # plotly paper coordinates: y=1 at top
+        # paper coordinates: top=1, bottom=0
         cell_y1 = 1.0 - row * cell_h
         cell_y0 = 1.0 - (row + 1) * cell_h
 
-        # donut domain inside the cell
         x0 = cell_x0 + cell_w * left_pad
         x1 = cell_x1 - cell_w * right_pad
         y0 = cell_y0 + cell_h * bottom_pad
@@ -132,7 +148,7 @@ def plot_monthly_spending_donuts(
                     colors=[color_map[c] for c in labels],
                     line=dict(color="white", width=2),
                 ),
-                textinfo="none",          # <- remove labels from slices
+                textinfo="none",   # no labels inside slices
                 hovertemplate=(
                     "<b>%{label}</b><br>"
                     f"Month: {month_label}<br>"
@@ -141,12 +157,11 @@ def plot_monthly_spending_donuts(
                     "Share: %{percent}<extra></extra>"
                 ),
                 customdata=events,
-                showlegend=(i == 0),      # show legend only once
-                legendgroup="categories",
+                showlegend=False,  # legend handled by dummy scatter traces
             )
         )
 
-        # total in donut center
+        # total in center
         fig.add_annotation(
             x=x_center,
             y=y_center,
@@ -160,7 +175,7 @@ def plot_monthly_spending_donuts(
             align="center",
         )
 
-        # month label directly under donut, aligned by same x center
+        # month label under donut
         fig.add_annotation(
             x=x_center,
             y=cell_y0 + cell_h * 0.08,
@@ -187,6 +202,9 @@ def plot_monthly_spending_donuts(
             xanchor="left",
             yanchor="top",
         ),
+        # hide axes from dummy scatter traces
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
     )
 
     return fig

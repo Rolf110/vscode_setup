@@ -4,13 +4,18 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 
-def plot_monthly_spending_with_apps(
+def plot_monthly_income_spending_with_apps(
     spend_df: pd.DataFrame,
     apps_df: pd.DataFrame | None = None,
     category_col: str = "operation type",
     spend_date_col: str = "local_date",
-    amount_col: str = "tatal_amount",   # rename if needed
+    amount_col: str = "tatal_amount",   # change if needed
     events_col: str = "n_events",
+    # mapping of operation type -> "income" / "spending"
+    flow_map: dict | None = None,
+    income_types: list[str] | None = None,
+    spending_types: list[str] | None = None,
+    # applications
     app_date_col: str = "app_dt",
     app_product_col: str = "product",
     app_subproduct_col: str = "subproduct",
@@ -18,16 +23,40 @@ def plot_monthly_spending_with_apps(
     app_term_col: str = "term",
     app_client_group_col: str = "client_group",
     app_amount_col: str = "amount",
+    # visual params
     max_cols: int = 6,
     hole: float = 0.58,
-    use_abs: bool = True,
-    title: str = "Monthly spending by category",
+    use_abs_for_spending_df: bool = True,
+    title: str = "Monthly income and spending by category",
     category_colors: dict | None = None,
     show_zero_app_block: bool = False,
 ):
-    # ---------------------------
-    # 1. Prepare spending data
-    # ---------------------------
+    # =========================================================
+    # 1. Prepare and validate flow mapping
+    # =========================================================
+    if flow_map is None:
+        flow_map = {}
+
+        income_types = income_types or []
+        spending_types = spending_types or []
+
+        overlap = set(income_types) & set(spending_types)
+        if overlap:
+            raise ValueError(
+                f"Some operation types are present in both income_types and spending_types: {sorted(overlap)}"
+            )
+
+        flow_map.update({x: "income" for x in income_types})
+        flow_map.update({x: "spending" for x in spending_types})
+
+    if not flow_map:
+        raise ValueError(
+            "Please provide either flow_map or income_types/spending_types."
+        )
+
+    # =========================================================
+    # 2. Prepare spending / income data
+    # =========================================================
     d = spend_df.copy()
 
     required_spend = [category_col, spend_date_col, amount_col, events_col]
@@ -40,37 +69,55 @@ def plot_monthly_spending_with_apps(
     d[amount_col] = pd.to_numeric(d[amount_col], errors="coerce").fillna(0)
     d[events_col] = pd.to_numeric(d[events_col], errors="coerce").fillna(0)
 
-    if use_abs:
+    if use_abs_for_spending_df:
         d[amount_col] = d[amount_col].abs()
 
     d["month"] = d[spend_date_col].dt.to_period("M").dt.to_timestamp()
+    d["flow_type"] = d[category_col].map(flow_map)
 
-    g_spend = (
-        d.groupby(["month", category_col], as_index=False)
+    unmapped = sorted(d.loc[d["flow_type"].isna(), category_col].unique().tolist())
+    if unmapped:
+        raise ValueError(
+            f"These operation types are not mapped to income/spending: {unmapped}"
+        )
+
+    d = d[d["flow_type"].isin(["income", "spending"])]
+
+    g_cash = (
+        d.groupby(["month", "flow_type", category_col], as_index=False)
         .agg(
             amount=(amount_col, "sum"),
             events=(events_col, "sum"),
         )
     )
 
-    g_spend = g_spend[g_spend["amount"] >= 0]
+    if g_cash.empty:
+        raise ValueError("No cashflow data to plot.")
 
-    if g_spend.empty:
-        raise ValueError("No spending data to plot.")
-
-    spend_months = sorted(g_spend["month"].unique())
-
-    category_order = (
-        g_spend.groupby(category_col)["amount"]
+    # Global category orders inside each flow type
+    income_categories = (
+        g_cash[g_cash["flow_type"] == "income"]
+        .groupby(category_col)["amount"]
         .sum()
         .sort_values(ascending=False)
         .index
         .tolist()
     )
 
-    # ---------------------------
-    # 2. Prepare application data
-    # ---------------------------
+    spending_categories = (
+        g_cash[g_cash["flow_type"] == "spending"]
+        .groupby(category_col)["amount"]
+        .sum()
+        .sort_values(ascending=False)
+        .index
+        .tolist()
+    )
+
+    all_categories = income_categories + spending_categories
+
+    # =========================================================
+    # 3. Prepare applications data
+    # =========================================================
     apps_summary = pd.DataFrame(columns=["month", "n_apps", "apps_amount_sum", "hover_html"])
 
     if apps_df is not None and len(apps_df) > 0:
@@ -100,22 +147,31 @@ def plot_monthly_spending_with_apps(
 
         a["month"] = a[app_date_col].dt.to_period("M").dt.to_timestamp()
 
-        # Concatenate product + subproduct
         a["product_full"] = (
             a[app_product_col].str.strip()
             + a[app_subproduct_col].map(lambda x: f" / {x.strip()}" if x.strip() else "")
         )
 
-        def build_hover_html(group: pd.DataFrame) -> str:
+        apps_summary = (
+            a.groupby("month", as_index=False)
+            .agg(
+                n_apps=(app_amount_col, "size"),
+                apps_amount_sum=(app_amount_col, "sum"),
+            )
+        )
+
+        def build_hover_html(month, group: pd.DataFrame) -> str:
+            month_label = pd.Timestamp(month).strftime("%m %Y")
+
             lines = [
-                f"<b>{pd.Timestamp(group['month'].iloc[0]).strftime('%m %Y')}</b>",
+                f"<b>{month_label}</b>",
                 f"Applications: {len(group)}",
                 f"Total amount: {group[app_amount_col].sum():,.0f}",
-                "<br><b>Applications details</b>"
+                "<br><b>Applications details</b>",
             ]
 
             for idx, (_, row) in enumerate(group.iterrows(), start=1):
-                term_val = "" if pd.isna(row[app_term_col]) else f"{row[app_term_col]:,.0f}"
+                term_val = "-" if pd.isna(row[app_term_col]) else f"{row[app_term_col]:,.0f}"
                 app_dt_str = pd.Timestamp(row[app_date_col]).strftime("%d.%m.%Y")
 
                 lines.extend([
@@ -123,37 +179,33 @@ def plot_monthly_spending_with_apps(
                     f"Date: {app_dt_str}",
                     f"Product: {row['product_full'] or '-'}",
                     f"Status: {row[app_status_col] or '-'}",
-                    f"Term: {term_val or '-'}",
+                    f"Term: {term_val}",
                     f"Client group: {row[app_client_group_col] or '-'}",
                     f"Amount: {row[app_amount_col]:,.0f}",
                 ])
 
             return "<br>".join(lines)
 
-        apps_summary = (
-            a.groupby("month", as_index=False)
-             .agg(
-                 n_apps=(app_amount_col, "size"),
-                 apps_amount_sum=(app_amount_col, "sum"),
-             )
-        )
-
-        hover_map = (
-            a.groupby("month")
-             .apply(build_hover_html)
-             .to_dict()
-        )
+        hover_map = {
+            month: build_hover_html(month, group)
+            for month, group in a.groupby("month", sort=True)
+        }
 
         apps_summary["hover_html"] = apps_summary["month"].map(hover_map)
 
-    # union of months from spending and apps
-    all_months = sorted(set(spend_months) | set(apps_summary["month"].tolist() if len(apps_summary) else []))
-    if not all_months:
-        raise ValueError("No months found.")
+    # =========================================================
+    # 4. Build month list
+    # =========================================================
+    cash_months = sorted(g_cash["month"].unique())
+    app_months = sorted(apps_summary["month"].unique()) if len(apps_summary) else []
+    all_months = sorted(set(cash_months) | set(app_months))
 
-    # ---------------------------
-    # 3. Colors
-    # ---------------------------
+    if not all_months:
+        raise ValueError("No months found to plot.")
+
+    # =========================================================
+    # 5. Colors
+    # =========================================================
     default_palette = (
         px.colors.qualitative.Safe
         + px.colors.qualitative.Set3
@@ -166,31 +218,48 @@ def plot_monthly_spending_with_apps(
 
     color_map = {}
     palette_idx = 0
-    for cat in category_order:
+    for cat in all_categories:
         if cat in category_colors:
             color_map[cat] = category_colors[cat]
         else:
             color_map[cat] = default_palette[palette_idx % len(default_palette)]
             palette_idx += 1
 
-    # ---------------------------
-    # 4. Layout grid
-    # ---------------------------
+    # =========================================================
+    # 6. Find which months should provide legend entries
+    # =========================================================
+    def month_total(month, flow_type, cats):
+        month_df = g_cash[
+            (g_cash["month"] == month) & (g_cash["flow_type"] == flow_type)
+        ].set_index(category_col)
+        return sum(float(month_df.loc[c, "amount"]) if c in month_df.index else 0.0 for c in cats)
+
+    first_income_legend_month = next(
+        (m for m in all_months if len(income_categories) > 0 and month_total(m, "income", income_categories) > 0),
+        None
+    )
+    first_spending_legend_month = next(
+        (m for m in all_months if len(spending_categories) > 0 and month_total(m, "spending", spending_categories) > 0),
+        None
+    )
+
+    # =========================================================
+    # 7. Layout
+    # =========================================================
     n_months = len(all_months)
     ncols = min(max_cols, n_months)
     nrows = math.ceil(n_months / ncols)
 
     fig = go.Figure()
-
-    # invisible Cartesian axes for app blocks
     fig.update_xaxes(visible=False, range=[0, 1], fixedrange=True)
     fig.update_yaxes(visible=False, range=[0, 1], fixedrange=True)
 
-    # paddings inside each cell
-    left_pad = 0.08
-    right_pad = 0.08
-    top_pad_for_app = 0.22
-    bottom_pad = 0.22
+    # one month = one cell containing 2 donuts
+    cell_left_pad = 0.05
+    cell_right_pad = 0.05
+    top_pad_for_app = 0.23
+    bottom_pad = 0.20
+    inner_gap = 0.06
 
     for i, month in enumerate(all_months):
         row = i // ncols
@@ -201,77 +270,172 @@ def plot_monthly_spending_with_apps(
 
         cell_x0 = col * cell_w
         cell_x1 = (col + 1) * cell_w
-
-        # paper coordinates
         cell_y1 = 1.0 - row * cell_h
         cell_y0 = 1.0 - (row + 1) * cell_h
 
-        # Donut domain leaves room above for app block
-        x0 = cell_x0 + cell_w * left_pad
-        x1 = cell_x1 - cell_w * right_pad
-        y0 = cell_y0 + cell_h * bottom_pad
-        y1 = cell_y1 - cell_h * top_pad_for_app
+        # area for both donuts
+        pair_x0 = cell_x0 + cell_w * cell_left_pad
+        pair_x1 = cell_x1 - cell_w * cell_right_pad
+        pair_y0 = cell_y0 + cell_h * bottom_pad
+        pair_y1 = cell_y1 - cell_h * top_pad_for_app
 
-        x_center = (x0 + x1) / 2
-        y_center = (y0 + y1) / 2
+        pair_w = pair_x1 - pair_x0
+        gap = pair_w * inner_gap
+        donut_w = (pair_w - gap) / 2
+
+        income_x0 = pair_x0
+        income_x1 = pair_x0 + donut_w
+
+        spending_x0 = income_x1 + gap
+        spending_x1 = pair_x1
+
+        donut_y0 = pair_y0
+        donut_y1 = pair_y1
+
+        income_center_x = (income_x0 + income_x1) / 2
+        spending_center_x = (spending_x0 + spending_x1) / 2
+        donut_center_y = (donut_y0 + donut_y1) / 2
+
+        month_center_x = (pair_x0 + pair_x1) / 2
         month_label = pd.Timestamp(month).strftime("%m %Y")
 
-        # ---------------------------
-        # Spending donut
-        # ---------------------------
-        month_df = g_spend[g_spend["month"] == month].set_index(category_col)
+        # -------- helper to get month/category values --------
+        def get_flow_values(flow_type, categories):
+            month_df = g_cash[
+                (g_cash["month"] == month) & (g_cash["flow_type"] == flow_type)
+            ].set_index(category_col)
 
-        labels = category_order
-        values = [float(month_df.loc[c, "amount"]) if c in month_df.index else 0.0 for c in labels]
-        events = [int(month_df.loc[c, "events"]) if c in month_df.index else 0 for c in labels]
+            labels = categories
+            values = [
+                float(month_df.loc[c, "amount"]) if c in month_df.index else 0.0
+                for c in labels
+            ]
+            events = [
+                int(month_df.loc[c, "events"]) if c in month_df.index else 0
+                for c in labels
+            ]
+            return labels, values, events
 
-        total_spend = sum(values)
+        # =====================================================
+        # Income donut
+        # =====================================================
+        if len(income_categories) > 0:
+            labels, values, events = get_flow_values("income", income_categories)
+            total_income = sum(values)
 
-        fig.add_trace(
-            go.Pie(
-                labels=labels,
-                values=values,
-                hole=hole,
-                sort=False,
-                direction="clockwise",
-                rotation=90,
-                domain=dict(x=[x0, x1], y=[y0, y1]),
-                marker=dict(
-                    colors=[color_map[c] for c in labels],
-                    line=dict(color="white", width=2),
-                ),
-                textinfo="none",
-                customdata=events,
-                hovertemplate=(
-                    "<b>%{label}</b><br>"
-                    f"Month: {month_label}<br>"
-                    "Amount: %{value:,.0f}<br>"
-                    "Events: %{customdata}<br>"
-                    "Share: %{percent}<extra></extra>"
-                ),
-                showlegend=(i == 0),
-                legendgroup="spending_categories",
+            fig.add_trace(
+                go.Pie(
+                    labels=labels,
+                    values=values,
+                    hole=hole,
+                    sort=False,
+                    direction="clockwise",
+                    rotation=90,
+                    domain=dict(x=[income_x0, income_x1], y=[donut_y0, donut_y1]),
+                    marker=dict(
+                        colors=[color_map[c] for c in labels],
+                        line=dict(color="white", width=2),
+                    ),
+                    textinfo="none",
+                    customdata=events,
+                    hovertemplate=(
+                        "<b>%{label}</b><br>"
+                        f"Month: {month_label}<br>"
+                        "Amount: %{value:,.0f}<br>"
+                        "Events: %{customdata}<br>"
+                        "Share: %{percent}<extra></extra>"
+                    ),
+                    showlegend=(month == first_income_legend_month),
+                )
             )
-        )
 
-        # total spend in center
-        fig.add_annotation(
-            x=x_center,
-            y=y_center,
-            xref="paper",
-            yref="paper",
-            text=f"{total_spend:,.0f}",
-            showarrow=False,
-            xanchor="center",
-            yanchor="middle",
-            font=dict(size=14),
-            align="center",
-        )
+            fig.add_annotation(
+                x=income_center_x,
+                y=donut_y1 + cell_h * 0.02,
+                xref="paper",
+                yref="paper",
+                text="Income",
+                showarrow=False,
+                xanchor="center",
+                yanchor="bottom",
+                font=dict(size=12),
+            )
 
-        # month label under donut
+            fig.add_annotation(
+                x=income_center_x,
+                y=donut_center_y,
+                xref="paper",
+                yref="paper",
+                text=f"{total_income:,.0f}",
+                showarrow=False,
+                xanchor="center",
+                yanchor="middle",
+                font=dict(size=12),
+            )
+
+        # =====================================================
+        # Spending donut
+        # =====================================================
+        if len(spending_categories) > 0:
+            labels, values, events = get_flow_values("spending", spending_categories)
+            total_spending = sum(values)
+
+            fig.add_trace(
+                go.Pie(
+                    labels=labels,
+                    values=values,
+                    hole=hole,
+                    sort=False,
+                    direction="clockwise",
+                    rotation=90,
+                    domain=dict(x=[spending_x0, spending_x1], y=[donut_y0, donut_y1]),
+                    marker=dict(
+                        colors=[color_map[c] for c in labels],
+                        line=dict(color="white", width=2),
+                    ),
+                    textinfo="none",
+                    customdata=events,
+                    hovertemplate=(
+                        "<b>%{label}</b><br>"
+                        f"Month: {month_label}<br>"
+                        "Amount: %{value:,.0f}<br>"
+                        "Events: %{customdata}<br>"
+                        "Share: %{percent}<extra></extra>"
+                    ),
+                    showlegend=(month == first_spending_legend_month),
+                )
+            )
+
+            fig.add_annotation(
+                x=spending_center_x,
+                y=donut_y1 + cell_h * 0.02,
+                xref="paper",
+                yref="paper",
+                text="Spending",
+                showarrow=False,
+                xanchor="center",
+                yanchor="bottom",
+                font=dict(size=12),
+            )
+
+            fig.add_annotation(
+                x=spending_center_x,
+                y=donut_center_y,
+                xref="paper",
+                yref="paper",
+                text=f"{total_spending:,.0f}",
+                showarrow=False,
+                xanchor="center",
+                yanchor="middle",
+                font=dict(size=12),
+            )
+
+        # =====================================================
+        # Month label under both donuts
+        # =====================================================
         fig.add_annotation(
-            x=x_center,
-            y=cell_y0 + cell_h * 0.07,
+            x=month_center_x,
+            y=cell_y0 + cell_h * 0.06,
             xref="paper",
             yref="paper",
             text=month_label,
@@ -279,12 +443,11 @@ def plot_monthly_spending_with_apps(
             xanchor="center",
             yanchor="middle",
             font=dict(size=13),
-            align="center",
         )
 
-        # ---------------------------
-        # Application block above donut
-        # ---------------------------
+        # =====================================================
+        # Application block above donuts
+        # =====================================================
         app_row = apps_summary[apps_summary["month"] == month]
 
         if len(app_row) > 0:
@@ -296,7 +459,7 @@ def plot_monthly_spending_with_apps(
 
             fig.add_trace(
                 go.Scatter(
-                    x=[x_center],
+                    x=[month_center_x],
                     y=[cell_y1 - cell_h * 0.08],
                     mode="markers+text",
                     text=[block_text],
@@ -317,7 +480,7 @@ def plot_monthly_spending_with_apps(
         elif show_zero_app_block:
             fig.add_trace(
                 go.Scatter(
-                    x=[x_center],
+                    x=[month_center_x],
                     y=[cell_y1 - cell_h * 0.08],
                     mode="markers+text",
                     text=["0 apps<br>0"],
@@ -334,14 +497,17 @@ def plot_monthly_spending_with_apps(
                 )
             )
 
+    # =========================================================
+    # 8. Layout
+    # =========================================================
     fig.update_layout(
         title=title,
         template="plotly_white",
-        width=max(450, 260 * ncols + 180),
-        height=max(360, 320 * nrows + 40),
-        margin=dict(l=20, r=180, t=70, b=30),
+        width=max(700, 320 * ncols + 180),
+        height=max(380, 330 * nrows + 40),
+        margin=dict(l=20, r=220, t=70, b=30),
         legend=dict(
-            title="Category",
+            title="Operation type",
             x=1.02,
             y=1,
             xanchor="left",

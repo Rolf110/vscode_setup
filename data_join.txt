@@ -2,52 +2,250 @@ import polars as pl
 from itertools import combinations
 
 
-def match_amounts_for_date(
-    left: pl.DataFrame,
-    right: pl.DataFrame,
-    tolerance: int = 3,
+def reconcile_amounts_full(
+    df1: pl.DataFrame,
+    df2: pl.DataFrame,
+    *,
+    tolerance: int | float = 3,
+    date_col: str = "local_date",
+    amount_col: str = "amount_rur",
+    credit_col: str = "credit_id",
+    extra_left_cols: list[str] | None = None,
+    extra_right_cols: list[str] | None = None,
+    right_prefix: str = "df2_",
+    output_cols: list[str] | None = None,
+    max_combo_size: int | None = None,
 ) -> pl.DataFrame:
-    left_rows = left.with_row_index("df1_row_id").to_dicts()
-    right_rows = right.with_row_index("df2_row_id").to_dicts()
+    """
+    Reconcile df1 transactions to df2 aggregated rows per local_date.
 
-    used = set()
-    matches = []
+    df1 columns expected:
+        local_date, amount_rur, ...
 
-    # Usually useful: match smaller/exact targets first
-    right_rows = sorted(right_rows, key=lambda r: r["amount"])
+    df2 columns expected:
+        local_date, amount_rur, credit_id, ...
 
-    for r in right_rows:
-        available = [x for x in left_rows if x["df1_row_id"] not in used]
+    For matched df1 rows:
+        amount_rur = original df1 amount
+        credit_id = inferred credit_id from df2
+        matched_df2_amount = df2 aggregated amount
 
-        best_combo = None
-        best_score = None
-        best_delta = None
+    For unmatched df1 rows:
+        credit_id = null
+        matched_df2_amount = null
 
-        for k in range(1, len(available) + 1):
-            for combo in combinations(available, k):
-                combo_sum = sum(x["amount"] for x in combo)
-                delta = combo_sum - r["amount"]
+    For unmatched df2 rows:
+        amount_rur = null
+        credit_id = df2 credit_id
+        matched_df2_amount = df2 amount_rur
+    """
 
-                if abs(delta) <= tolerance:
-                    # Prefer smallest deviation, then fewest rows
-                    score = (abs(delta), k)
+    extra_left_cols = extra_left_cols or []
+    extra_right_cols = extra_right_cols or []
 
-                    if best_score is None or score < best_score:
-                        best_score = score
-                        best_combo = combo
-                        best_delta = delta
+    required_left = {date_col, amount_col, *extra_left_cols}
+    required_right = {date_col, amount_col, credit_col, *extra_right_cols}
 
-        if best_combo is not None:
-            for x in best_combo:
-                used.add(x["df1_row_id"])
-                matches.append({
-                    "date": x["date"],
-                    "amount": x["amount"],
-                    "credit_id": r["credit_id"],
-                    "matched_df2_amount": r["amount"],
-                    "matched_sum": sum(y["amount"] for y in best_combo),
-                    "delta": best_delta,
-                    "abs_delta": abs(best_delta),
-                })
+    missing_left = required_left - set(df1.columns)
+    missing_right = required_right - set(df2.columns)
 
-    return pl.DataFrame(matches)
+    if missing_left:
+        raise ValueError(f"df1 is missing columns: {sorted(missing_left)}")
+    if missing_right:
+        raise ValueError(f"df2 is missing columns: {sorted(missing_right)}")
+
+    df1_i = df1.with_row_index("__df1_row_id")
+    df2_i = df2.with_row_index("__df2_row_id")
+
+    right_extra_out_cols = [f"{right_prefix}{c}" for c in extra_right_cols]
+
+    base_cols = [
+        date_col,
+        amount_col,
+        credit_col,
+        "matched_df2_amount",
+        "match_status",
+        "matched_sum",
+        "delta",
+    ]
+
+    created_cols = list(dict.fromkeys(
+        base_cols + extra_left_cols + right_extra_out_cols
+    ))
+
+    def make_record(
+        *,
+        left_row: dict | None,
+        right_row: dict | None,
+        status: str,
+        amount_value,
+        credit_value,
+        matched_df2_amount,
+        matched_sum,
+        delta,
+    ) -> dict:
+        rec = {c: None for c in created_cols}
+
+        rec[date_col] = (
+            left_row[date_col]
+            if left_row is not None
+            else right_row[date_col]
+        )
+        rec[amount_col] = amount_value
+        rec[credit_col] = credit_value
+        rec["matched_df2_amount"] = matched_df2_amount
+        rec["match_status"] = status
+        rec["matched_sum"] = matched_sum
+        rec["delta"] = delta
+
+        for c in extra_left_cols:
+            rec[c] = left_row.get(c) if left_row is not None else None
+
+        for c in extra_right_cols:
+            rec[f"{right_prefix}{c}"] = right_row.get(c) if right_row is not None else None
+
+        return rec
+
+    def date_slice(frame: pl.DataFrame, date_value) -> pl.DataFrame:
+        if date_value is None:
+            return frame.filter(pl.col(date_col).is_null())
+        return frame.filter(pl.col(date_col) == date_value)
+
+    all_dates = (
+        pl.concat(
+            [
+                df1_i.select(date_col),
+                df2_i.select(date_col),
+            ],
+            how="vertical_relaxed",
+        )
+        .unique()
+        .get_column(date_col)
+        .to_list()
+    )
+
+    records = []
+
+    for current_date in all_dates:
+        left = date_slice(df1_i, current_date)
+        right = date_slice(df2_i, current_date)
+
+        left_rows = left.to_dicts()
+        right_rows = right.to_dicts()
+
+        used_left_ids = set()
+        used_right_ids = set()
+
+        # Smaller targets first helps exact/simple matches happen before larger combinations.
+        right_rows_sorted = sorted(
+            right_rows,
+            key=lambda r: (
+                r.get(amount_col) is None,
+                abs(r.get(amount_col) or 0),
+            ),
+        )
+
+        for r in right_rows_sorted:
+            target = r.get(amount_col)
+
+            if target is None:
+                continue
+
+            available_left = [
+                x
+                for x in left_rows
+                if x["__df1_row_id"] not in used_left_ids
+                and x.get(amount_col) is not None
+            ]
+
+            max_k = len(available_left)
+            if max_combo_size is not None:
+                max_k = min(max_k, max_combo_size)
+
+            best_combo = None
+            best_sum = None
+            best_delta = None
+            best_score = None
+
+            for k in range(1, max_k + 1):
+                for combo in combinations(available_left, k):
+                    combo_sum = sum(x[amount_col] for x in combo)
+                    delta = combo_sum - target
+
+                    if abs(delta) <= tolerance:
+                        # Prefer:
+                        # 1. smallest absolute deviation
+                        # 2. fewest rows
+                        # 3. deterministic row order
+                        score = (
+                            abs(delta),
+                            k,
+                            tuple(x["__df1_row_id"] for x in combo),
+                        )
+
+                        if best_score is None or score < best_score:
+                            best_score = score
+                            best_combo = combo
+                            best_sum = combo_sum
+                            best_delta = delta
+
+            if best_combo is not None:
+                used_right_ids.add(r["__df2_row_id"])
+
+                for x in best_combo:
+                    used_left_ids.add(x["__df1_row_id"])
+
+                    records.append(
+                        make_record(
+                            left_row=x,
+                            right_row=r,
+                            status="matched",
+                            amount_value=x[amount_col],
+                            credit_value=r[credit_col],
+                            matched_df2_amount=r[amount_col],
+                            matched_sum=best_sum,
+                            delta=best_delta,
+                        )
+                    )
+
+        # Unmatched df1 rows
+        for x in left_rows:
+            if x["__df1_row_id"] not in used_left_ids:
+                records.append(
+                    make_record(
+                        left_row=x,
+                        right_row=None,
+                        status="left_only",
+                        amount_value=x[amount_col],
+                        credit_value=None,
+                        matched_df2_amount=None,
+                        matched_sum=None,
+                        delta=None,
+                    )
+                )
+
+        # Unmatched df2 rows
+        for r in right_rows:
+            if r["__df2_row_id"] not in used_right_ids:
+                records.append(
+                    make_record(
+                        left_row=None,
+                        right_row=r,
+                        status="right_only",
+                        amount_value=None,
+                        credit_value=r[credit_col],
+                        matched_df2_amount=r[amount_col],
+                        matched_sum=None,
+                        delta=None,
+                    )
+                )
+
+    result = pl.DataFrame(records) if records else pl.DataFrame({c: [] for c in created_cols})
+
+    final_cols = output_cols or created_cols
+
+    for c in final_cols:
+        if c not in result.columns:
+            result = result.with_columns(pl.lit(None).alias(c))
+
+    return result.select(final_cols)

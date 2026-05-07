@@ -1,3 +1,6 @@
+import re
+from datetime import date, datetime, timedelta
+
 import polars as pl
 
 
@@ -6,6 +9,7 @@ def reconcile_amounts_full(
     df2: pl.DataFrame,
     *,
     tolerance: int | float = 3,
+    date_tolerance: int | float | str | timedelta = "1d",
     date_col: str = "local_date",
     amount_col: str = "amount_rur",
     credit_col: str = "credit_id",
@@ -19,16 +23,30 @@ def reconcile_amounts_full(
     Reconcile raw df1 transactions to df2 daily aggregates.
 
     Matching logic:
-        1. Aggregate df1 by date implicitly inside the loop.
-        2. Aggregate df2 by date first, because df2 may contain several rows
+        1. df2 is aggregated by date, because it may have multiple rows
            per date for different credit_id values.
-        3. Compare daily sums:
-               sum(df1.amount_rur) ~= sum(df2.amount_rur)
-        4. If matched, all raw df1 rows for that date are marked as matched.
+        2. df1 is grouped by date logically, but raw rows are preserved.
+        3. A df1 date group may match a df2 date group within ±date_tolerance.
+        4. Match is accepted when:
 
-    Important:
-        Since several df2 rows may exist for the same date, credit_id becomes
-        a list of credit IDs for the matched date.
+               abs(sum(df1.amount_rur) - sum(df2.amount_rur)) <= tolerance
+
+           and
+
+               abs(df1.local_date - df2.local_date) <= date_tolerance
+
+    date_tolerance examples:
+        1       -> 1 day
+        "1d"    -> 1 day
+        "2 days" -> 2 days
+        "24h"   -> 1 day
+        timedelta(days=1)
+
+    Output:
+        local_date          = original df1 date for matched / left_only rows
+        matched_df2_date    = matched df2 aggregate date
+        date_delta_days     = df1 date - df2 date, in days
+        credit_id           = list of credit_ids from matched df2 date
     """
 
     extra_left_cols = extra_left_cols or []
@@ -44,6 +62,87 @@ def reconcile_amounts_full(
         raise ValueError(f"df1 is missing columns: {sorted(missing_left)}")
     if missing_right:
         raise ValueError(f"df2 is missing columns: {sorted(missing_right)}")
+
+    def parse_date_tolerance(value: int | float | str | timedelta) -> float:
+        if isinstance(value, timedelta):
+            return abs(value.total_seconds() / 86_400)
+
+        if isinstance(value, (int, float)):
+            return abs(float(value))
+
+        if isinstance(value, str):
+            value_clean = value.strip().lower()
+
+            match = re.fullmatch(
+                r"([0-9]+(?:\.[0-9]+)?)\s*(d|day|days)",
+                value_clean,
+            )
+            if match:
+                return abs(float(match.group(1)))
+
+            match = re.fullmatch(
+                r"([0-9]+(?:\.[0-9]+)?)\s*(h|hour|hours)",
+                value_clean,
+            )
+            if match:
+                return abs(float(match.group(1)) / 24)
+
+        raise ValueError(
+            "date_tolerance must be int/float days, timedelta, "
+            'or string like "1d", "2 days", "24h".'
+        )
+
+    def normalize_to_date(value) -> date | None:
+        if value is None:
+            return None
+
+        if isinstance(value, datetime):
+            return value.date()
+
+        if isinstance(value, date):
+            return value
+
+        if isinstance(value, str):
+            value_clean = value.strip()
+
+            try:
+                return datetime.fromisoformat(
+                    value_clean.replace("Z", "+00:00")
+                ).date()
+            except ValueError:
+                pass
+
+            try:
+                return date.fromisoformat(value_clean[:10])
+            except ValueError:
+                pass
+
+        raise ValueError(
+            f"Could not parse {date_col} value as date: {value!r}"
+        )
+
+    def date_distance_days(left_date, right_date) -> float:
+        left_norm = normalize_to_date(left_date)
+        right_norm = normalize_to_date(right_date)
+
+        if left_norm is None and right_norm is None:
+            return 0
+
+        if left_norm is None or right_norm is None:
+            return float("inf")
+
+        return abs((left_norm - right_norm).days)
+
+    def signed_date_delta_days(left_date, right_date) -> int | None:
+        left_norm = normalize_to_date(left_date)
+        right_norm = normalize_to_date(right_date)
+
+        if left_norm is None or right_norm is None:
+            return None
+
+        return (left_norm - right_norm).days
+
+    max_date_distance = parse_date_tolerance(date_tolerance)
 
     df1_i = df1.with_row_index("__df1_row_id")
 
@@ -74,7 +173,7 @@ def reconcile_amounts_full(
                 ],
             ]
         )
-        .with_row_index("__df2_row_id")
+        .with_row_index("__df2_day_id")
     )
 
     right_extra_out_cols = [f"{right_prefix}{c}" for c in extra_right_cols]
@@ -83,10 +182,12 @@ def reconcile_amounts_full(
         date_col,
         amount_col,
         credit_col,
+        "matched_df2_date",
         "matched_df2_amount",
         "match_status",
         "matched_sum",
         "delta",
+        "date_delta_days",
     ]
 
     created_cols = list(
@@ -100,9 +201,11 @@ def reconcile_amounts_full(
         status: str,
         amount_value,
         credit_value,
+        matched_df2_date,
         matched_df2_amount,
         matched_sum,
         delta,
+        date_delta,
     ) -> dict:
         rec = {c: None for c in created_cols}
 
@@ -111,12 +214,15 @@ def reconcile_amounts_full(
             if left_row is not None
             else right_row[date_col]
         )
+
         rec[amount_col] = amount_value
         rec[credit_col] = credit_value
+        rec["matched_df2_date"] = matched_df2_date
         rec["matched_df2_amount"] = matched_df2_amount
         rec["match_status"] = status
         rec["matched_sum"] = matched_sum
         rec["delta"] = delta
+        rec["date_delta_days"] = date_delta
 
         for c in extra_left_cols:
             rec[c] = left_row.get(c) if left_row is not None else None
@@ -128,106 +234,155 @@ def reconcile_amounts_full(
 
         return rec
 
-    def date_slice(frame: pl.DataFrame, date_value) -> pl.DataFrame:
-        if date_value is None:
-            return frame.filter(pl.col(date_col).is_null())
-        return frame.filter(pl.col(date_col) == date_value)
-
-    all_dates = (
-        pl.concat(
-            [
-                df1_i.select(date_col),
-                df2_daily.select(date_col),
-            ],
-            how="vertical_relaxed",
-        )
-        .unique(maintain_order=True)
-        .get_column(date_col)
-        .to_list()
-    )
-
-    records = []
-
-    for current_date in all_dates:
-        left = date_slice(df1_i, current_date)
-        right = date_slice(df2_daily, current_date)
-
-        left_rows = left.to_dicts()
-        right_rows = right.to_dicts()
-
-        right_row = right_rows[0] if right_rows else None
-
-        left_amounts = [
+    def daily_sum(rows: list[dict]):
+        values = [
             row[amount_col]
-            for row in left_rows
+            for row in rows
             if row.get(amount_col) is not None
         ]
+        return sum(values) if values else None
 
-        left_sum = sum(left_amounts) if left_amounts else None
+    # Preserve original left row order.
+    left_rows_all = df1_i.to_dicts()
+    right_rows_all = df2_daily.to_dicts()
 
-        right_amount = (
-            right_row.get(amount_col)
-            if right_row is not None
-            else None
-        )
+    left_by_date: dict[object, list[dict]] = {}
+    for row in left_rows_all:
+        left_by_date.setdefault(row[date_col], []).append(row)
 
-        is_matched = (
-            bool(left_rows)
-            and right_row is not None
-            and left_sum is not None
-            and right_amount is not None
-            and abs(left_sum - right_amount) <= tolerance
-        )
+    left_day_rows = [
+        {
+            "left_date": left_date,
+            "left_rows": rows,
+            "left_sum": daily_sum(rows),
+        }
+        for left_date, rows in left_by_date.items()
+    ]
 
-        if is_matched:
-            delta = left_sum - right_amount
+    used_left_dates = set()
+    used_right_ids = set()
+    records = []
+
+    # Greedy one-to-one daily matching:
+    # one left date group can match one right date group within date tolerance.
+    for left_day in left_day_rows:
+        left_date = left_day["left_date"]
+        left_rows = left_day["left_rows"]
+        left_sum = left_day["left_sum"]
+
+        best_right = None
+        best_delta = None
+        best_date_delta = None
+        best_score = None
+
+        if left_sum is not None:
+            for right_row in right_rows_all:
+                right_id = right_row["__df2_day_id"]
+
+                if right_id in used_right_ids:
+                    continue
+
+                right_amount = right_row.get(amount_col)
+
+                if right_amount is None:
+                    continue
+
+                distance = date_distance_days(left_date, right_row[date_col])
+
+                if distance > max_date_distance:
+                    continue
+
+                amount_delta = left_sum - right_amount
+
+                if abs(amount_delta) > tolerance:
+                    continue
+
+                signed_date_delta = signed_date_delta_days(
+                    left_date,
+                    right_row[date_col],
+                )
+
+                # Prefer:
+                # 1. smallest amount deviation
+                # 2. closest date
+                # 3. deterministic right-side order
+                score = (
+                    abs(amount_delta),
+                    distance,
+                    right_id,
+                )
+
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_right = right_row
+                    best_delta = amount_delta
+                    best_date_delta = signed_date_delta
+
+        if best_right is not None:
+            used_left_dates.add(left_date)
+            used_right_ids.add(best_right["__df2_day_id"])
 
             for left_row in left_rows:
                 records.append(
                     make_record(
                         left_row=left_row,
-                        right_row=right_row,
+                        right_row=best_right,
                         status="matched",
                         amount_value=left_row[amount_col],
-                        credit_value=right_row[credit_col],
-                        matched_df2_amount=right_amount,
+                        credit_value=best_right[credit_col],
+                        matched_df2_date=best_right[date_col],
+                        matched_df2_amount=best_right[amount_col],
                         matched_sum=left_sum,
-                        delta=delta,
+                        delta=best_delta,
+                        date_delta=best_date_delta,
                     )
                 )
 
-        else:
-            for left_row in left_rows:
-                records.append(
-                    make_record(
-                        left_row=left_row,
-                        right_row=None,
-                        status="left_only",
-                        amount_value=left_row[amount_col],
-                        credit_value=None,
-                        matched_df2_amount=None,
-                        matched_sum=left_sum,
-                        delta=None,
-                    )
-                )
+    # Unmatched df1 date groups
+    for left_day in left_day_rows:
+        left_date = left_day["left_date"]
 
-            if right_row is not None:
-                records.append(
-                    make_record(
-                        left_row=None,
-                        right_row=right_row,
-                        status="right_only",
-                        amount_value=None,
-                        credit_value=right_row[credit_col],
-                        matched_df2_amount=right_amount,
-                        matched_sum=left_sum,
-                        delta=(
-                            left_sum - right_amount
-                            if left_sum is not None and right_amount is not None
-                            else None
-                        ),
-                    )
+        if left_date in used_left_dates:
+            continue
+
+        left_rows = left_day["left_rows"]
+        left_sum = left_day["left_sum"]
+
+        for left_row in left_rows:
+            records.append(
+                make_record(
+                    left_row=left_row,
+                    right_row=None,
+                    status="left_only",
+                    amount_value=left_row[amount_col],
+                    credit_value=None,
+                    matched_df2_date=None,
+                    matched_df2_amount=None,
+                    matched_sum=left_sum,
+                    delta=None,
+                    date_delta=None,
                 )
+            )
+
+    # Unmatched df2 daily aggregates
+    for right_row in right_rows_all:
+        if right_row["__df2_day_id"] in used_right_ids:
+            continue
+
+        records.append(
+            make_record(
+                left_row=None,
+                right_row=right_row,
+                status="right_only",
+                amount_value=None,
+                credit_value=right_row[credit_col],
+                matched_df2_date=right_row[date_col],
+                matched_df2_amount=right_row[amount_col],
+                matched_sum=None,
+                delta=None,
+                date_delta=None,
+            )
+        )
 
     result = (
         pl.DataFrame(records)

@@ -1,0 +1,234 @@
+import polars as pl
+
+
+def reconcile_amounts_full(
+    df1: pl.DataFrame,
+    df2: pl.DataFrame,
+    *,
+    tolerance: int | float = 3,
+    date_col: str = "local_date",
+    amount_col: str = "amount_rur",
+    credit_col: str = "credit_id",
+    extra_left_cols: list[str] | None = None,
+    extra_right_cols: list[str] | None = None,
+    right_prefix: str = "df2_",
+    output_cols: list[str] | None = None,
+    max_combo_size: int | None = None,  # kept only for backward compatibility
+) -> pl.DataFrame:
+    """
+    Reconcile raw df1 transactions to df2 daily aggregate rows.
+
+    Matching logic:
+        For each local_date:
+            sum(df1.amount_rur) is compared with df2.amount_rur.
+
+        If abs(df1_daily_sum - df2_daily_amount) <= tolerance:
+            all df1 rows for that date are marked as matched.
+
+        Otherwise:
+            df1 rows are marked as left_only
+            df2 row is marked as right_only
+
+    Assumption:
+        df2 contains at most one aggregate row per date.
+    """
+
+    extra_left_cols = extra_left_cols or []
+    extra_right_cols = extra_right_cols or []
+
+    required_left = {date_col, amount_col, *extra_left_cols}
+    required_right = {date_col, amount_col, credit_col, *extra_right_cols}
+
+    missing_left = required_left - set(df1.columns)
+    missing_right = required_right - set(df2.columns)
+
+    if missing_left:
+        raise ValueError(f"df1 is missing columns: {sorted(missing_left)}")
+    if missing_right:
+        raise ValueError(f"df2 is missing columns: {sorted(missing_right)}")
+
+    df1_i = df1.with_row_index("__df1_row_id")
+    df2_i = df2.with_row_index("__df2_row_id")
+
+    # This version expects df2 to already be daily aggregates.
+    duplicated_right_dates = (
+        df2_i
+        .group_by(date_col)
+        .agg(pl.len().alias("__n"))
+        .filter(pl.col("__n") > 1)
+        .select(date_col)
+        .get_column(date_col)
+        .to_list()
+    )
+
+    if duplicated_right_dates:
+        raise ValueError(
+            f"df2 must contain at most one aggregate row per {date_col}. "
+            f"Duplicated dates found: {duplicated_right_dates[:10]}"
+        )
+
+    right_extra_out_cols = [f"{right_prefix}{c}" for c in extra_right_cols]
+
+    base_cols = [
+        date_col,
+        amount_col,
+        credit_col,
+        "matched_df2_amount",
+        "match_status",
+        "matched_sum",
+        "delta",
+    ]
+
+    created_cols = list(
+        dict.fromkeys(base_cols + extra_left_cols + right_extra_out_cols)
+    )
+
+    def make_record(
+        *,
+        left_row: dict | None,
+        right_row: dict | None,
+        status: str,
+        amount_value,
+        credit_value,
+        matched_df2_amount,
+        matched_sum,
+        delta,
+    ) -> dict:
+        rec = {c: None for c in created_cols}
+
+        rec[date_col] = (
+            left_row[date_col]
+            if left_row is not None
+            else right_row[date_col]
+        )
+        rec[amount_col] = amount_value
+        rec[credit_col] = credit_value
+        rec["matched_df2_amount"] = matched_df2_amount
+        rec["match_status"] = status
+        rec["matched_sum"] = matched_sum
+        rec["delta"] = delta
+
+        for c in extra_left_cols:
+            rec[c] = left_row.get(c) if left_row is not None else None
+
+        for c in extra_right_cols:
+            rec[f"{right_prefix}{c}"] = (
+                right_row.get(c) if right_row is not None else None
+            )
+
+        return rec
+
+    def date_slice(frame: pl.DataFrame, date_value) -> pl.DataFrame:
+        if date_value is None:
+            return frame.filter(pl.col(date_col).is_null())
+        return frame.filter(pl.col(date_col) == date_value)
+
+    all_dates = (
+        pl.concat(
+            [
+                df1_i.select(date_col),
+                df2_i.select(date_col),
+            ],
+            how="vertical_relaxed",
+        )
+        .unique(maintain_order=True)
+        .get_column(date_col)
+        .to_list()
+    )
+
+    records = []
+
+    for current_date in all_dates:
+        left = date_slice(df1_i, current_date)
+        right = date_slice(df2_i, current_date)
+
+        left_rows = left.to_dicts()
+        right_rows = right.to_dicts()
+
+        right_row = right_rows[0] if right_rows else None
+
+        left_amounts = [
+            row[amount_col]
+            for row in left_rows
+            if row.get(amount_col) is not None
+        ]
+
+        left_sum = sum(left_amounts) if left_amounts else None
+
+        right_amount = (
+            right_row.get(amount_col)
+            if right_row is not None
+            else None
+        )
+
+        is_matched = (
+            bool(left_rows)
+            and right_row is not None
+            and left_sum is not None
+            and right_amount is not None
+            and abs(left_sum - right_amount) <= tolerance
+        )
+
+        if is_matched:
+            delta = left_sum - right_amount
+
+            for left_row in left_rows:
+                records.append(
+                    make_record(
+                        left_row=left_row,
+                        right_row=right_row,
+                        status="matched",
+                        amount_value=left_row[amount_col],
+                        credit_value=right_row[credit_col],
+                        matched_df2_amount=right_amount,
+                        matched_sum=left_sum,
+                        delta=delta,
+                    )
+                )
+
+        else:
+            for left_row in left_rows:
+                records.append(
+                    make_record(
+                        left_row=left_row,
+                        right_row=None,
+                        status="left_only",
+                        amount_value=left_row[amount_col],
+                        credit_value=None,
+                        matched_df2_amount=None,
+                        matched_sum=left_sum,
+                        delta=None,
+                    )
+                )
+
+            if right_row is not None:
+                records.append(
+                    make_record(
+                        left_row=None,
+                        right_row=right_row,
+                        status="right_only",
+                        amount_value=None,
+                        credit_value=right_row[credit_col],
+                        matched_df2_amount=right_amount,
+                        matched_sum=left_sum,
+                        delta=(
+                            left_sum - right_amount
+                            if left_sum is not None and right_amount is not None
+                            else None
+                        ),
+                    )
+                )
+
+    result = (
+        pl.DataFrame(records)
+        if records
+        else pl.DataFrame({c: [] for c in created_cols})
+    )
+
+    final_cols = output_cols or created_cols
+
+    for c in final_cols:
+        if c not in result.columns:
+            result = result.with_columns(pl.lit(None).alias(c))
+
+    return result.select(final_cols)

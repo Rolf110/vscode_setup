@@ -16,21 +16,19 @@ def reconcile_amounts_full(
     max_combo_size: int | None = None,  # kept only for backward compatibility
 ) -> pl.DataFrame:
     """
-    Reconcile raw df1 transactions to df2 daily aggregate rows.
+    Reconcile raw df1 transactions to df2 daily aggregates.
 
     Matching logic:
-        For each local_date:
-            sum(df1.amount_rur) is compared with df2.amount_rur.
+        1. Aggregate df1 by date implicitly inside the loop.
+        2. Aggregate df2 by date first, because df2 may contain several rows
+           per date for different credit_id values.
+        3. Compare daily sums:
+               sum(df1.amount_rur) ~= sum(df2.amount_rur)
+        4. If matched, all raw df1 rows for that date are marked as matched.
 
-        If abs(df1_daily_sum - df2_daily_amount) <= tolerance:
-            all df1 rows for that date are marked as matched.
-
-        Otherwise:
-            df1 rows are marked as left_only
-            df2 row is marked as right_only
-
-    Assumption:
-        df2 contains at most one aggregate row per date.
+    Important:
+        Since several df2 rows may exist for the same date, credit_id becomes
+        a list of credit IDs for the matched date.
     """
 
     extra_left_cols = extra_left_cols or []
@@ -48,24 +46,36 @@ def reconcile_amounts_full(
         raise ValueError(f"df2 is missing columns: {sorted(missing_right)}")
 
     df1_i = df1.with_row_index("__df1_row_id")
-    df2_i = df2.with_row_index("__df2_row_id")
 
-    # This version expects df2 to already be daily aggregates.
-    duplicated_right_dates = (
-        df2_i
-        .group_by(date_col)
-        .agg(pl.len().alias("__n"))
-        .filter(pl.col("__n") > 1)
-        .select(date_col)
-        .get_column(date_col)
-        .to_list()
-    )
+    # Aggregate right table by date.
+    # amount_col is summed.
+    # credit_col and extra_right_cols are collected as unique lists.
+    df2_daily = (
+        df2
+        .group_by(date_col, maintain_order=True)
+        .agg(
+            [
+                pl.when(pl.col(amount_col).is_not_null().any())
+                .then(pl.col(amount_col).sum())
+                .otherwise(None)
+                .alias(amount_col),
 
-    if duplicated_right_dates:
-        raise ValueError(
-            f"df2 must contain at most one aggregate row per {date_col}. "
-            f"Duplicated dates found: {duplicated_right_dates[:10]}"
+                pl.col(credit_col)
+                .drop_nulls()
+                .unique(maintain_order=True)
+                .alias(credit_col),
+
+                *[
+                    pl.col(c)
+                    .drop_nulls()
+                    .unique(maintain_order=True)
+                    .alias(c)
+                    for c in extra_right_cols
+                ],
+            ]
         )
+        .with_row_index("__df2_row_id")
+    )
 
     right_extra_out_cols = [f"{right_prefix}{c}" for c in extra_right_cols]
 
@@ -127,7 +137,7 @@ def reconcile_amounts_full(
         pl.concat(
             [
                 df1_i.select(date_col),
-                df2_i.select(date_col),
+                df2_daily.select(date_col),
             ],
             how="vertical_relaxed",
         )
@@ -140,7 +150,7 @@ def reconcile_amounts_full(
 
     for current_date in all_dates:
         left = date_slice(df1_i, current_date)
-        right = date_slice(df2_i, current_date)
+        right = date_slice(df2_daily, current_date)
 
         left_rows = left.to_dicts()
         right_rows = right.to_dicts()

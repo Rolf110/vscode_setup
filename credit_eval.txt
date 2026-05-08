@@ -1,0 +1,50 @@
+import polars as pl
+
+def reeval_payments(df: pl.DataFrame) -> pl.DataFrame:
+    return (
+        df
+        .sort("local_date")
+        .with_columns([
+            # Normalize payment amount: payments are negative in amount_rur
+            pl.when(pl.col("row_type") == "PAYMENT")
+              .then(-pl.col("amount_rur"))
+              .otherwise(0)
+              .alias("actual_payment"),
+
+            pl.col("payment_primary_amt").fill_null(0).alias("primary_due"),
+            pl.col("payment_interest_amt").fill_null(0).alias("interest_due"),
+
+            pl.when(pl.col("row_type") == "CREDIT TAKE")
+              .then(pl.col("amount"))
+              .otherwise(0)
+              .alias("credit_issued"),
+        ])
+        .with_columns([
+            (pl.col("primary_due") + pl.col("interest_due")).alias("payment_needed"),
+        ])
+        .with_columns([
+            pl.col("actual_payment").cum_sum().alias("cum_paid"),
+            pl.col("payment_needed").cum_sum().alias("cum_needed"),
+            pl.col("credit_issued").cum_sum().alias("total_credit_issued"),
+        ])
+        .with_columns([
+            # Positive means client has paid more than required so far
+            (pl.col("cum_paid") - pl.col("cum_needed"))
+                .clip(lower_bound=0)
+                .alias("overpaid_to_date"),
+
+            # Positive means client is behind schedule
+            (pl.col("cum_needed") - pl.col("cum_paid"))
+                .clip(lower_bound=0)
+                .alias("underpaid_to_date"),
+        ])
+        .with_columns([
+            # Re-evaluated status
+            pl.when(pl.col("overpaid_to_date") > 0)
+              .then(pl.lit("PAID_AHEAD"))
+              .when(pl.col("underpaid_to_date") > 0)
+              .then(pl.lit("UNDERPAID"))
+              .otherwise(pl.lit("OK"))
+              .alias("reeval_payment_status")
+        ])
+    )

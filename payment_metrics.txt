@@ -1,319 +1,336 @@
-import numpy as np
-import pandas as pd
+import polars as pl
 
 
-def _safe_div(a, b, default=np.nan):
-    return default if b is None or b == 0 or pd.isna(b) else a / b
+ID_COLS = ["unique_app_id", "credit_id"]
 
 
-def _weighted_mean(x, w):
-    x = np.asarray(x, dtype=float)
-    w = np.asarray(w, dtype=float)
-    mask = np.isfinite(x) & np.isfinite(w) & (w > 0)
-    if mask.sum() == 0:
-        return np.nan
-    return np.average(x[mask], weights=w[mask])
+def payment_regularity_polars(
+    df: pl.DataFrame,
+    grace_days: int = 0,
+    amount_tolerance: float = 0.95,
+    as_of_date=None,  # optional: "2026-05-13" for active credits
+) -> pl.DataFrame:
+    """
+    Input df schema:
+        unique_app_id: str
+        credit_id: int
+        local_date: list[date]
+        amount: list[float]
+        overdue_length: list[int]
+        credit_amount: float
+        term: float
 
+    Returns:
+        one row per unique_app_id-credit_id with robust payment regularity metrics.
+    """
 
-def _cv(x):
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
-    if len(x) < 2 or np.mean(x) == 0:
-        return np.nan
-    return np.std(x, ddof=1) / np.mean(x)
-
-
-def _mad(x):
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
-    if len(x) == 0:
-        return np.nan
-    med = np.median(x)
-    return np.median(np.abs(x - med))
-
-
-def _prepare_long(df):
-    list_cols = ["local_date", "amount", "overdue_length"]
-
-    # Optional safety check: list columns should have equal lengths per row.
-    lengths = df[list_cols].map(lambda x: len(x) if isinstance(x, (list, tuple, np.ndarray, pd.Series)) else 1)
-    bad = lengths.nunique(axis=1) != 1
-    if bad.any():
-        bad_rows = df.loc[bad, ["unique_app_id", "credit_id"]]
-        raise ValueError(
-            "local_date, amount, and overdue_length must have equal list lengths per row. "
-            f"Bad rows:\n{bad_rows.head()}"
+    base = (
+        df
+        .select(ID_COLS + ["credit_amount", "term"])
+        .unique(subset=ID_COLS)
+        .with_columns(
+            pl.col("credit_amount").cast(pl.Float64),
+            pl.col("term").cast(pl.Float64),
         )
+        .with_columns(
+            expected_installment=(pl.col("credit_amount") / pl.col("term")),
+            target_total=(pl.col("credit_amount") * amount_tolerance),
+        )
+    )
 
-    long_df = df.explode(list_cols, ignore_index=True).copy()
+    # 1. Explode list columns: one row = one payment transaction.
+    payments = (
+        df
+        .explode(["local_date", "amount", "overdue_length"])
+        .with_columns(
+            pl.col("local_date").cast(pl.Date),
+            pl.col("amount").cast(pl.Float64),
+            pl.col("overdue_length").cast(pl.Int64),
+        )
+        .filter(
+            pl.col("local_date").is_not_null()
+            & pl.col("amount").is_not_null()
+            & (pl.col("amount") > 0)
+        )
+        .with_columns(
+            dpd=pl.when(pl.col("overdue_length") < 0)
+                  .then(0)
+                  .otherwise(pl.col("overdue_length"))
+                  .cast(pl.Float64),
+            payment_month=pl.col("local_date").dt.truncate("1mo"),
+        )
+        .join(base, on=ID_COLS, how="left")
+        .sort(ID_COLS + ["local_date"])
+        .with_columns(
+            cum_paid=pl.col("amount").cum_sum().over(ID_COLS)
+        )
+        .with_columns(
+            dpd_median=pl.col("dpd").median().over(ID_COLS),
+            amount_x_dpd=pl.col("amount") * pl.col("dpd"),
+        )
+    )
 
-    long_df["local_date"] = pd.to_datetime(long_df["local_date"])
-    long_df["amount"] = pd.to_numeric(long_df["amount"], errors="coerce")
-    long_df["overdue_length"] = pd.to_numeric(long_df["overdue_length"], errors="coerce")
+    # 2. Payoff date: first date where cumulative payment reaches target.
+    payoff = (
+        payments
+        .filter(pl.col("cum_paid") >= pl.col("target_total"))
+        .group_by(ID_COLS)
+        .agg(
+            payoff_date=pl.col("local_date").min()
+        )
+    )
 
-    long_df = long_df.dropna(subset=["local_date", "amount"])
-    long_df = long_df[long_df["amount"] > 0]
+    # 3. Per-credit bounds.
+    bounds = (
+        payments
+        .group_by(ID_COLS)
+        .agg(
+            first_payment_date=pl.col("local_date").min(),
+            last_payment_date=pl.col("local_date").max(),
+            start_month=pl.col("payment_month").min(),
+            last_payment_month=pl.col("payment_month").max(),
+        )
+        .join(payoff, on=ID_COLS, how="left")
+    )
 
-    long_df["dpd"] = long_df["overdue_length"].clip(lower=0)
-    long_df["payment_month"] = long_df["local_date"].dt.to_period("M")
-
-    return long_df
-
-
-def _credit_metrics_one(g, grace_days=0, amount_tolerance=0.95, as_of_date=None):
-    g = g.sort_values("local_date").copy()
-
-    unique_app_id = g["unique_app_id"].iloc[0]
-    credit_id = g["credit_id"].iloc[0]
-    credit_amount = float(g["credit_amount"].iloc[0])
-    term = int(np.ceil(float(g["term"].iloc[0])))
-
-    if credit_amount <= 0 or term <= 0:
-        return pd.Series({
-            "unique_app_id": unique_app_id,
-            "credit_id": credit_id,
-            "bad_credit_params": 1
-        })
-
-    expected_installment = credit_amount / term
-
-    total_paid = g["amount"].sum()
-    paid_ratio = total_paid / credit_amount
-    is_fully_paid = total_paid >= amount_tolerance * credit_amount
-
-    g["cum_paid"] = g["amount"].cumsum()
-
-    payoff_rows = g[g["cum_paid"] >= amount_tolerance * credit_amount]
-    payoff_date = payoff_rows["local_date"].iloc[0] if len(payoff_rows) else pd.NaT
-
-    first_payment_date = g["local_date"].min()
-    last_payment_date = g["local_date"].max()
-
-    # Without credit issue date, use first payment month as observed start.
-    # If you have issue_date or first_due_date, replace this with that.
-    start_month = first_payment_date.to_period("M")
-
-    if pd.notna(payoff_date):
-        end_month = payoff_date.to_period("M")
-    elif as_of_date is not None:
-        end_month = pd.to_datetime(as_of_date).to_period("M")
+    if as_of_date is None:
+        end_month_expr = pl.when(pl.col("payoff_date").is_not_null()) \
+            .then(pl.col("payoff_date").dt.truncate("1mo")) \
+            .otherwise(pl.col("last_payment_month"))
     else:
-        end_month = last_payment_date.to_period("M")
+        end_month_expr = pl.when(pl.col("payoff_date").is_not_null()) \
+            .then(pl.col("payoff_date").dt.truncate("1mo")) \
+            .otherwise(pl.lit(as_of_date).cast(pl.Date).dt.truncate("1mo"))
 
-    if end_month < start_month:
-        end_month = start_month
+    bounds = bounds.with_columns(end_month=end_month_expr)
 
-    months = pd.period_range(start_month, end_month, freq="M")
-    n_observed_months = len(months)
-
-    monthly = (
-        g.groupby("payment_month")
-         .agg(
-             monthly_paid=("amount", "sum"),
-             n_payments=("amount", "size"),
-             monthly_weighted_dpd=("dpd", lambda x: _weighted_mean(x, g.loc[x.index, "amount"]))
-         )
-         .reindex(months)
+    # 4. Monthly payment aggregation.
+    monthly_paid = (
+        payments
+        .group_by(ID_COLS + ["payment_month"])
+        .agg(
+            monthly_paid=pl.col("amount").sum(),
+            n_payments=pl.len(),
+            monthly_weighted_dpd=(
+                (pl.col("amount") * pl.col("dpd")).sum() / pl.col("amount").sum()
+            ),
+        )
     )
 
-    monthly["monthly_paid"] = monthly["monthly_paid"].fillna(0.0)
-    monthly["n_payments"] = monthly["n_payments"].fillna(0).astype(int)
-
-    monthly_paid = monthly["monthly_paid"].to_numpy()
-    n_payments_month = monthly["n_payments"].to_numpy()
-
-    monthly_coverage = monthly_paid / expected_installment
-    monthly_coverage_capped = np.minimum(monthly_coverage, 1.0)
-    monthly_shortfall_ratio = np.maximum(0, expected_installment - monthly_paid) / expected_installment
-
-    monthly_adequacy_rate = np.mean(monthly_paid >= amount_tolerance * expected_installment)
-    avg_monthly_coverage_capped = np.mean(monthly_coverage_capped)
-    avg_monthly_shortfall_ratio = np.mean(monthly_shortfall_ratio)
-
-    # Cumulative schedule adherence.
-    # Month 1 expected cumulative = 1 installment, month 2 = 2 installments, etc.,
-    # capped at total credit_amount.
-    cumulative_paid_by_month = np.cumsum(monthly_paid)
-    expected_cumulative = np.minimum(
-        np.arange(1, n_observed_months + 1) * expected_installment,
-        credit_amount
-    )
-
-    cumulative_coverage = np.minimum(cumulative_paid_by_month / expected_cumulative, 1.0)
-    cumulative_coverage_auc = np.mean(cumulative_coverage)
-
-    cumulative_shortfall_installments = np.maximum(
-        0,
-        expected_cumulative - cumulative_paid_by_month
-    ) / expected_installment
-
-    avg_cumulative_shortfall_installments = np.mean(cumulative_shortfall_installments)
-    max_cumulative_shortfall_installments = np.max(cumulative_shortfall_installments)
-
-    # DPD / overdue metrics.
-    amount_on_time_rate = (
-        g.loc[g["dpd"] <= grace_days, "amount"].sum() / total_paid
-        if total_paid > 0 else np.nan
-    )
-
-    weighted_mean_dpd = _weighted_mean(g["dpd"], g["amount"])
-    max_dpd = g["dpd"].max()
-    p95_dpd = g["dpd"].quantile(0.95)
-    dpd_mad = _mad(g["dpd"])
-
-    share_amount_dpd_pos = g.loc[g["dpd"] > 0, "amount"].sum() / total_paid
-    share_amount_dpd30 = g.loc[g["dpd"] >= 30, "amount"].sum() / total_paid
-    share_amount_dpd60 = g.loc[g["dpd"] >= 60, "amount"].sum() / total_paid
-    share_amount_dpd90 = g.loc[g["dpd"] >= 90, "amount"].sum() / total_paid
-
-    if len(g) >= 2:
-        dpd_trend_per_payment = np.polyfit(np.arange(len(g)), g["dpd"].to_numpy(dtype=float), 1)[0]
-    else:
-        dpd_trend_per_payment = np.nan
-
-    # Payment frequency / split-payment metrics.
-    paid_months = np.sum(monthly_paid > 0)
-    payment_month_rate = paid_months / n_observed_months if n_observed_months > 0 else np.nan
-
-    split_month_rate = (
-        np.sum((monthly_paid > 0) & (n_payments_month >= 2)) / paid_months
-        if paid_months > 0 else np.nan
-    )
-
-    avg_payments_per_paid_month = (
-        np.mean(n_payments_month[monthly_paid > 0])
-        if paid_months > 0 else np.nan
-    )
-
-    # Within-month fragmentation: 1.0 means one payment per paid month;
-    # lower means more split payments.
-    month_hhis = []
-    for _, mg in g.groupby("payment_month"):
-        s = mg["amount"].sum()
-        if s > 0:
-            shares = mg["amount"] / s
-            month_hhis.append(np.sum(shares ** 2))
-
-    avg_within_month_amount_hhi = np.mean(month_hhis) if month_hhis else np.nan
-
-    # Raw transaction gaps: keep as diagnostic only.
-    payment_dates_unique = g["local_date"].drop_duplicates().sort_values()
-    raw_gaps_days = payment_dates_unique.diff().dt.days.dropna()
-    raw_gap_cv = _cv(raw_gaps_days)
-
-    paid_month_ordinals = np.array([p.ordinal for p in monthly.index[monthly_paid > 0]])
-    month_gaps = np.diff(paid_month_ordinals)
-    payment_month_gap_cv = _cv(month_gaps)
-
-    # Early payoff.
-    if pd.notna(payoff_date):
-        payoff_month_num = (payoff_date.to_period("M").ordinal - start_month.ordinal) + 1
-        early_payoff_ratio = max(0, term - payoff_month_num) / term
-    else:
-        payoff_month_num = np.nan
-        early_payoff_ratio = 0.0
-
-    # Composite score: intentionally does NOT penalize split payments.
-    dpd_score = 1 / (1 + weighted_mean_dpd / 30) if pd.notna(weighted_mean_dpd) else np.nan
-    shortfall_score = 1 / (1 + avg_cumulative_shortfall_installments)
-
-    regularity_score = 100 * (
-        0.35 * cumulative_coverage_auc
-        + 0.25 * amount_on_time_rate
-        + 0.20 * dpd_score
-        + 0.20 * shortfall_score
-    )
-
-    return pd.Series({
-        "unique_app_id": unique_app_id,
-        "credit_id": credit_id,
-
-        "credit_amount": credit_amount,
-        "term": term,
-        "expected_installment": expected_installment,
-
-        "n_payments": len(g),
-        "first_payment_date": first_payment_date,
-        "last_payment_date": last_payment_date,
-        "observed_months": n_observed_months,
-
-        "total_paid": total_paid,
-        "paid_ratio": paid_ratio,
-        "is_fully_paid": int(is_fully_paid),
-        "payoff_date": payoff_date,
-        "payoff_month_num": payoff_month_num,
-        "early_payoff_ratio": early_payoff_ratio,
-
-        # Best amount-aware regularity metrics.
-        "cumulative_coverage_auc": cumulative_coverage_auc,
-        "avg_cumulative_shortfall_installments": avg_cumulative_shortfall_installments,
-        "max_cumulative_shortfall_installments": max_cumulative_shortfall_installments,
-        "monthly_adequacy_rate": monthly_adequacy_rate,
-        "avg_monthly_coverage_capped": avg_monthly_coverage_capped,
-        "avg_monthly_shortfall_ratio": avg_monthly_shortfall_ratio,
-
-        # Timing / overdue metrics.
-        "amount_on_time_rate": amount_on_time_rate,
-        "weighted_mean_dpd": weighted_mean_dpd,
-        "max_dpd": max_dpd,
-        "p95_dpd": p95_dpd,
-        "dpd_mad": dpd_mad,
-        "dpd_trend_per_payment": dpd_trend_per_payment,
-        "share_amount_dpd_pos": share_amount_dpd_pos,
-        "share_amount_dpd30": share_amount_dpd30,
-        "share_amount_dpd60": share_amount_dpd60,
-        "share_amount_dpd90": share_amount_dpd90,
-
-        # Split-payment behavior.
-        "payment_month_rate": payment_month_rate,
-        "split_month_rate": split_month_rate,
-        "avg_payments_per_paid_month": avg_payments_per_paid_month,
-        "avg_within_month_amount_hhi": avg_within_month_amount_hhi,
-
-        # Diagnostics only.
-        "raw_gap_cv": raw_gap_cv,
-        "payment_month_gap_cv": payment_month_gap_cv,
-
-        # Composite.
-        "regularity_score": regularity_score,
-    })
-
-
-def evaluate_credit_payment_regularity(
-    df,
-    grace_days=0,
-    amount_tolerance=0.95,
-    as_of_date=None
-):
-    """
-    Returns one row per unique_app_id-credit_id.
-
-    Parameters
-    ----------
-    grace_days:
-        Payment is considered on-time when overdue_length <= grace_days.
-
-    amount_tolerance:
-        0.95 means an installment is considered adequate if at least 95% is paid.
-
-    as_of_date:
-        Optional observation end date. Useful for active loans.
-        If None, observed period ends at payoff date or last payment date.
-    """
-    long_df = _prepare_long(df)
-
-    metrics = (
-        long_df
-        .groupby(["unique_app_id", "credit_id"], group_keys=False)
-        .apply(
-            lambda g: _credit_metrics_one(
-                g,
-                grace_days=grace_days,
-                amount_tolerance=amount_tolerance,
-                as_of_date=as_of_date
+    # 5. Within-month fragmentation: HHI close to 1 means one dominant payment.
+    monthly_hhi = (
+        payments
+        .with_columns(
+            month_amount_share=(
+                pl.col("amount")
+                / pl.col("amount").sum().over(ID_COLS + ["payment_month"])
             )
         )
-        .reset_index(drop=True)
+        .group_by(ID_COLS + ["payment_month"])
+        .agg(
+            month_amount_hhi=(pl.col("month_amount_share") ** 2).sum()
+        )
     )
 
-    return metrics
+    # 6. Build complete month grid, including months with no payment.
+    month_grid = (
+        bounds
+        .with_columns(
+            payment_month=pl.date_ranges(
+                pl.col("start_month"),
+                pl.col("end_month"),
+                interval="1mo",
+                closed="both",
+            )
+        )
+        .explode("payment_month")
+        .select(ID_COLS + ["payment_month"])
+    )
+
+    monthly = (
+        month_grid
+        .join(base, on=ID_COLS, how="left")
+        .join(monthly_paid, on=ID_COLS + ["payment_month"], how="left")
+        .join(monthly_hhi, on=ID_COLS + ["payment_month"], how="left")
+        .sort(ID_COLS + ["payment_month"])
+        .with_columns(
+            monthly_paid=pl.col("monthly_paid").fill_null(0.0),
+            n_payments=pl.col("n_payments").fill_null(0),
+        )
+        .with_columns(
+            month_num=pl.col("payment_month").rank("ordinal").over(ID_COLS).cast(pl.Float64),
+            cum_paid_by_month=pl.col("monthly_paid").cum_sum().over(ID_COLS),
+        )
+        .with_columns(
+            expected_cum=pl.min_horizontal(
+                pl.col("month_num") * pl.col("expected_installment"),
+                pl.col("credit_amount"),
+            ),
+            monthly_coverage=pl.col("monthly_paid") / pl.col("expected_installment"),
+            monthly_shortfall_ratio=(
+                (pl.col("expected_installment") - pl.col("monthly_paid")).clip(lower_bound=0)
+                / pl.col("expected_installment")
+            ),
+        )
+        .with_columns(
+            cumulative_coverage=pl.min_horizontal(
+                pl.col("cum_paid_by_month") / pl.col("expected_cum"),
+                pl.lit(1.0),
+            ),
+            cumulative_shortfall_installments=(
+                (pl.col("expected_cum") - pl.col("cum_paid_by_month")).clip(lower_bound=0)
+                / pl.col("expected_installment")
+            ),
+        )
+    )
+
+    # 7. Monthly/obligation-level metrics.
+    monthly_features = (
+        monthly
+        .group_by(ID_COLS)
+        .agg(
+            observed_months=pl.len(),
+
+            cumulative_coverage_auc=pl.col("cumulative_coverage").mean(),
+            avg_cumulative_shortfall_installments=pl.col(
+                "cumulative_shortfall_installments"
+            ).mean(),
+            max_cumulative_shortfall_installments=pl.col(
+                "cumulative_shortfall_installments"
+            ).max(),
+
+            monthly_adequacy_rate=(
+                pl.col("monthly_paid") >= amount_tolerance * pl.col("expected_installment")
+            ).mean(),
+
+            avg_monthly_coverage_capped=pl.min_horizontal(
+                pl.col("monthly_coverage"),
+                pl.lit(1.0),
+            ).mean(),
+
+            avg_monthly_shortfall_ratio=pl.col("monthly_shortfall_ratio").mean(),
+
+            payment_month_rate=(pl.col("monthly_paid") > 0).mean(),
+
+            split_month_rate=(
+                ((pl.col("monthly_paid") > 0) & (pl.col("n_payments") >= 2)).sum()
+                / (pl.col("monthly_paid") > 0).sum()
+            ),
+
+            avg_payments_per_paid_month=pl.col("n_payments")
+                .filter(pl.col("monthly_paid") > 0)
+                .mean(),
+
+            avg_within_month_amount_hhi=pl.col("month_amount_hhi").mean(),
+        )
+    )
+
+    # 8. Transaction-level DPD metrics.
+    credit_features = (
+        payments
+        .group_by(ID_COLS)
+        .agg(
+            credit_amount=pl.col("credit_amount").first(),
+            term=pl.col("term").first(),
+            expected_installment=pl.col("expected_installment").first(),
+
+            n_payments=pl.len(),
+            total_paid=pl.col("amount").sum(),
+
+            first_payment_date=pl.col("local_date").min(),
+            last_payment_date=pl.col("local_date").max(),
+
+            amount_on_time_rate=(
+                pl.col("amount").filter(pl.col("dpd") <= grace_days).sum()
+                / pl.col("amount").sum()
+            ),
+
+            weighted_mean_dpd=pl.col("amount_x_dpd").sum() / pl.col("amount").sum(),
+            max_dpd=pl.col("dpd").max(),
+            p95_dpd=pl.col("dpd").quantile(0.95),
+            dpd_mad=(pl.col("dpd") - pl.col("dpd_median")).abs().median(),
+
+            share_amount_dpd_pos=(
+                pl.col("amount").filter(pl.col("dpd") > 0).sum()
+                / pl.col("amount").sum()
+            ),
+            share_amount_dpd30=(
+                pl.col("amount").filter(pl.col("dpd") >= 30).sum()
+                / pl.col("amount").sum()
+            ),
+            share_amount_dpd60=(
+                pl.col("amount").filter(pl.col("dpd") >= 60).sum()
+                / pl.col("amount").sum()
+            ),
+            share_amount_dpd90=(
+                pl.col("amount").filter(pl.col("dpd") >= 90).sum()
+                / pl.col("amount").sum()
+            ),
+        )
+        .with_columns(
+            paid_ratio=pl.col("total_paid") / pl.col("credit_amount"),
+            is_fully_paid=(pl.col("total_paid") >= amount_tolerance * pl.col("credit_amount")).cast(pl.Int8),
+        )
+    )
+
+    # 9. Raw transaction gap CV: diagnostic only.
+    raw_gap_features = (
+        payments
+        .select(ID_COLS + ["local_date"])
+        .unique()
+        .sort(ID_COLS + ["local_date"])
+        .with_columns(
+            raw_gap_days=pl.col("local_date").cast(pl.Int64).diff().over(ID_COLS)
+        )
+        .group_by(ID_COLS)
+        .agg(
+            raw_gap_cv=pl.col("raw_gap_days").std() / pl.col("raw_gap_days").mean()
+        )
+    )
+
+    # 10. Payment-month gap CV: also diagnostic.
+    month_gap_features = (
+        monthly
+        .filter(pl.col("monthly_paid") > 0)
+        .select(ID_COLS + ["payment_month"])
+        .sort(ID_COLS + ["payment_month"])
+        .with_columns(
+            month_ordinal=(
+                pl.col("payment_month").dt.year() * 12
+                + pl.col("payment_month").dt.month()
+            )
+        )
+        .with_columns(
+            payment_month_gap=pl.col("month_ordinal").diff().over(ID_COLS)
+        )
+        .group_by(ID_COLS)
+        .agg(
+            payment_month_gap_cv=(
+                pl.col("payment_month_gap").std()
+                / pl.col("payment_month_gap").mean()
+            )
+        )
+    )
+
+    # 11. Final table + composite score.
+    result = (
+        credit_features
+        .join(bounds.select(ID_COLS + ["payoff_date"]), on=ID_COLS, how="left")
+        .join(monthly_features, on=ID_COLS, how="left")
+        .join(raw_gap_features, on=ID_COLS, how="left")
+        .join(month_gap_features, on=ID_COLS, how="left")
+        .with_columns(
+            dpd_score=1 / (1 + pl.col("weighted_mean_dpd") / 30),
+            shortfall_score=1 / (1 + pl.col("avg_cumulative_shortfall_installments")),
+        )
+        .with_columns(
+            regularity_score=100 * (
+                0.35 * pl.col("cumulative_coverage_auc")
+                + 0.25 * pl.col("amount_on_time_rate")
+                + 0.20 * pl.col("dpd_score")
+                + 0.20 * pl.col("shortfall_score")
+            )
+        )
+    )
+
+    return result

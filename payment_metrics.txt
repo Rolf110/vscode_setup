@@ -1,51 +1,35 @@
 import polars as pl
 
-
 ID_COLS = ["unique_app_id", "credit_id"]
 
 
-def payment_regularity_polars(
+def payment_regularity_polars_safe(
     df: pl.DataFrame,
     grace_days: int = 0,
     amount_tolerance: float = 0.95,
-    as_of_date=None,  # optional: "2026-05-13" for active credits
 ) -> pl.DataFrame:
-    """
-    Input df schema:
-        unique_app_id: str
-        credit_id: int
-        local_date: list[date]
-        amount: list[float]
-        overdue_length: list[int]
-        credit_amount: float
-        term: float
-
-    Returns:
-        one row per unique_app_id-credit_id with robust payment regularity metrics.
-    """
 
     base = (
         df
         .select(ID_COLS + ["credit_amount", "term"])
         .unique(subset=ID_COLS)
         .with_columns(
-            pl.col("credit_amount").cast(pl.Float64),
-            pl.col("term").cast(pl.Float64),
+            pl.col("credit_amount").cast(pl.Float64, strict=False),
+            pl.col("term").cast(pl.Float64, strict=False),
         )
         .with_columns(
-            expected_installment=(pl.col("credit_amount") / pl.col("term")),
-            target_total=(pl.col("credit_amount") * amount_tolerance),
+            expected_installment=pl.col("credit_amount") / pl.col("term"),
+            target_total=pl.col("credit_amount") * amount_tolerance,
         )
     )
 
-    # 1. Explode list columns: one row = one payment transaction.
     payments = (
         df
         .explode(["local_date", "amount", "overdue_length"])
         .with_columns(
-            pl.col("local_date").cast(pl.Date),
-            pl.col("amount").cast(pl.Float64),
-            pl.col("overdue_length").cast(pl.Int64),
+            pl.col("local_date").cast(pl.Date, strict=False),
+            pl.col("amount").cast(pl.Float64, strict=False),
+            pl.col("overdue_length").cast(pl.Int64, strict=False),
         )
         .filter(
             pl.col("local_date").is_not_null()
@@ -53,190 +37,38 @@ def payment_regularity_polars(
             & (pl.col("amount") > 0)
         )
         .with_columns(
-            dpd=pl.when(pl.col("overdue_length") < 0)
-                  .then(0)
-                  .otherwise(pl.col("overdue_length"))
-                  .cast(pl.Float64),
+            dpd=pl.max_horizontal(pl.col("overdue_length"), pl.lit(0)).cast(pl.Float64),
             payment_month=pl.col("local_date").dt.truncate("1mo"),
         )
         .join(base, on=ID_COLS, how="left")
         .sort(ID_COLS + ["local_date"])
         .with_columns(
-            cum_paid=pl.col("amount").cum_sum().over(ID_COLS)
-        )
-        .with_columns(
-            dpd_median=pl.col("dpd").median().over(ID_COLS),
+            cum_paid=pl.col("amount").cum_sum().over(ID_COLS),
             amount_x_dpd=pl.col("amount") * pl.col("dpd"),
         )
     )
 
-    # 2. Payoff date: first date where cumulative payment reaches target.
-    payoff = (
-        payments
-        .filter(pl.col("cum_paid") >= pl.col("target_total"))
-        .group_by(ID_COLS)
-        .agg(
-            payoff_date=pl.col("local_date").min()
+    # If no valid payments exist, return base rows with null/default metrics.
+    if payments.height == 0:
+        return base.with_columns(
+            n_payments=pl.lit(0),
+            total_paid=pl.lit(0.0),
+            paid_ratio=pl.lit(0.0),
+            is_fully_paid=pl.lit(0),
+            regularity_score=pl.lit(None, dtype=pl.Float64),
+            cumulative_coverage_auc=pl.lit(None, dtype=pl.Float64),
+            monthly_adequacy_rate=pl.lit(None, dtype=pl.Float64),
+            amount_on_time_rate=pl.lit(None, dtype=pl.Float64),
+            weighted_mean_dpd=pl.lit(None, dtype=pl.Float64),
+            split_month_rate=pl.lit(None, dtype=pl.Float64),
         )
-    )
 
-    # 3. Per-credit bounds.
-    bounds = (
-        payments
-        .group_by(ID_COLS)
-        .agg(
-            first_payment_date=pl.col("local_date").min(),
-            last_payment_date=pl.col("local_date").max(),
-            start_month=pl.col("payment_month").min(),
-            last_payment_month=pl.col("payment_month").max(),
-        )
-        .join(payoff, on=ID_COLS, how="left")
-    )
-
-    if as_of_date is None:
-        end_month_expr = pl.when(pl.col("payoff_date").is_not_null()) \
-            .then(pl.col("payoff_date").dt.truncate("1mo")) \
-            .otherwise(pl.col("last_payment_month"))
-    else:
-        end_month_expr = pl.when(pl.col("payoff_date").is_not_null()) \
-            .then(pl.col("payoff_date").dt.truncate("1mo")) \
-            .otherwise(pl.lit(as_of_date).cast(pl.Date).dt.truncate("1mo"))
-
-    bounds = bounds.with_columns(end_month=end_month_expr)
-
-    # 4. Monthly payment aggregation.
-    monthly_paid = (
-        payments
-        .group_by(ID_COLS + ["payment_month"])
-        .agg(
-            monthly_paid=pl.col("amount").sum(),
-            n_payments=pl.len(),
-            monthly_weighted_dpd=(
-                (pl.col("amount") * pl.col("dpd")).sum() / pl.col("amount").sum()
-            ),
-        )
-    )
-
-    # 5. Within-month fragmentation: HHI close to 1 means one dominant payment.
-    monthly_hhi = (
-        payments
-        .with_columns(
-            month_amount_share=(
-                pl.col("amount")
-                / pl.col("amount").sum().over(ID_COLS + ["payment_month"])
-            )
-        )
-        .group_by(ID_COLS + ["payment_month"])
-        .agg(
-            month_amount_hhi=(pl.col("month_amount_share") ** 2).sum()
-        )
-    )
-
-    # 6. Build complete month grid, including months with no payment.
-    month_grid = (
-        bounds
-        .with_columns(
-            payment_month=pl.date_ranges(
-                pl.col("start_month"),
-                pl.col("end_month"),
-                interval="1mo",
-                closed="both",
-            )
-        )
-        .explode("payment_month")
-        .select(ID_COLS + ["payment_month"])
-    )
-
-    monthly = (
-        month_grid
-        .join(base, on=ID_COLS, how="left")
-        .join(monthly_paid, on=ID_COLS + ["payment_month"], how="left")
-        .join(monthly_hhi, on=ID_COLS + ["payment_month"], how="left")
-        .sort(ID_COLS + ["payment_month"])
-        .with_columns(
-            monthly_paid=pl.col("monthly_paid").fill_null(0.0),
-            n_payments=pl.col("n_payments").fill_null(0),
-        )
-        .with_columns(
-            month_num=pl.col("payment_month").rank("ordinal").over(ID_COLS).cast(pl.Float64),
-            cum_paid_by_month=pl.col("monthly_paid").cum_sum().over(ID_COLS),
-        )
-        .with_columns(
-            expected_cum=pl.min_horizontal(
-                pl.col("month_num") * pl.col("expected_installment"),
-                pl.col("credit_amount"),
-            ),
-            monthly_coverage=pl.col("monthly_paid") / pl.col("expected_installment"),
-            monthly_shortfall_ratio=(
-                (pl.col("expected_installment") - pl.col("monthly_paid")).clip(lower_bound=0)
-                / pl.col("expected_installment")
-            ),
-        )
-        .with_columns(
-            cumulative_coverage=pl.min_horizontal(
-                pl.col("cum_paid_by_month") / pl.col("expected_cum"),
-                pl.lit(1.0),
-            ),
-            cumulative_shortfall_installments=(
-                (pl.col("expected_cum") - pl.col("cum_paid_by_month")).clip(lower_bound=0)
-                / pl.col("expected_installment")
-            ),
-        )
-    )
-
-    # 7. Monthly/obligation-level metrics.
-    monthly_features = (
-        monthly
-        .group_by(ID_COLS)
-        .agg(
-            observed_months=pl.len(),
-
-            cumulative_coverage_auc=pl.col("cumulative_coverage").mean(),
-            avg_cumulative_shortfall_installments=pl.col(
-                "cumulative_shortfall_installments"
-            ).mean(),
-            max_cumulative_shortfall_installments=pl.col(
-                "cumulative_shortfall_installments"
-            ).max(),
-
-            monthly_adequacy_rate=(
-                pl.col("monthly_paid") >= amount_tolerance * pl.col("expected_installment")
-            ).mean(),
-
-            avg_monthly_coverage_capped=pl.min_horizontal(
-                pl.col("monthly_coverage"),
-                pl.lit(1.0),
-            ).mean(),
-
-            avg_monthly_shortfall_ratio=pl.col("monthly_shortfall_ratio").mean(),
-
-            payment_month_rate=(pl.col("monthly_paid") > 0).mean(),
-
-            split_month_rate=(
-                ((pl.col("monthly_paid") > 0) & (pl.col("n_payments") >= 2)).sum()
-                / (pl.col("monthly_paid") > 0).sum()
-            ),
-
-            avg_payments_per_paid_month=pl.col("n_payments")
-                .filter(pl.col("monthly_paid") > 0)
-                .mean(),
-
-            avg_within_month_amount_hhi=pl.col("month_amount_hhi").mean(),
-        )
-    )
-
-    # 8. Transaction-level DPD metrics.
     credit_features = (
         payments
         .group_by(ID_COLS)
         .agg(
-            credit_amount=pl.col("credit_amount").first(),
-            term=pl.col("term").first(),
-            expected_installment=pl.col("expected_installment").first(),
-
             n_payments=pl.len(),
             total_paid=pl.col("amount").sum(),
-
             first_payment_date=pl.col("local_date").min(),
             last_payment_date=pl.col("local_date").max(),
 
@@ -248,12 +80,7 @@ def payment_regularity_polars(
             weighted_mean_dpd=pl.col("amount_x_dpd").sum() / pl.col("amount").sum(),
             max_dpd=pl.col("dpd").max(),
             p95_dpd=pl.col("dpd").quantile(0.95),
-            dpd_mad=(pl.col("dpd") - pl.col("dpd_median")).abs().median(),
 
-            share_amount_dpd_pos=(
-                pl.col("amount").filter(pl.col("dpd") > 0).sum()
-                / pl.col("amount").sum()
-            ),
             share_amount_dpd30=(
                 pl.col("amount").filter(pl.col("dpd") >= 30).sum()
                 / pl.col("amount").sum()
@@ -267,68 +94,67 @@ def payment_regularity_polars(
                 / pl.col("amount").sum()
             ),
         )
+    )
+
+    monthly = (
+        payments
+        .group_by(ID_COLS + ["payment_month"])
+        .agg(
+            monthly_paid=pl.col("amount").sum(),
+            n_payments_month=pl.len(),
+        )
+        .join(base, on=ID_COLS, how="left")
+        .with_columns(
+            monthly_adequate=(
+                pl.col("monthly_paid")
+                >= amount_tolerance * pl.col("expected_installment")
+            ),
+            monthly_coverage_capped=pl.min_horizontal(
+                pl.col("monthly_paid") / pl.col("expected_installment"),
+                pl.lit(1.0),
+            ),
+            monthly_shortfall_ratio=(
+                (pl.col("expected_installment") - pl.col("monthly_paid")).clip(lower_bound=0)
+                / pl.col("expected_installment")
+            ),
+        )
+    )
+
+    monthly_features = (
+        monthly
+        .group_by(ID_COLS)
+        .agg(
+            observed_paid_months=pl.len(),
+            monthly_adequacy_rate=pl.col("monthly_adequate").mean(),
+            avg_monthly_coverage_capped=pl.col("monthly_coverage_capped").mean(),
+            avg_monthly_shortfall_ratio=pl.col("monthly_shortfall_ratio").mean(),
+            split_month_rate=(pl.col("n_payments_month") >= 2).mean(),
+            avg_payments_per_paid_month=pl.col("n_payments_month").mean(),
+        )
+    )
+
+    result = (
+        base
+        .join(credit_features, on=ID_COLS, how="left")
+        .join(monthly_features, on=ID_COLS, how="left")
+        .with_columns(
+            total_paid=pl.col("total_paid").fill_null(0.0),
+            n_payments=pl.col("n_payments").fill_null(0),
+        )
         .with_columns(
             paid_ratio=pl.col("total_paid") / pl.col("credit_amount"),
-            is_fully_paid=(pl.col("total_paid") >= amount_tolerance * pl.col("credit_amount")).cast(pl.Int8),
-        )
-    )
-
-    # 9. Raw transaction gap CV: diagnostic only.
-    raw_gap_features = (
-        payments
-        .select(ID_COLS + ["local_date"])
-        .unique()
-        .sort(ID_COLS + ["local_date"])
-        .with_columns(
-            raw_gap_days=pl.col("local_date").cast(pl.Int64).diff().over(ID_COLS)
-        )
-        .group_by(ID_COLS)
-        .agg(
-            raw_gap_cv=pl.col("raw_gap_days").std() / pl.col("raw_gap_days").mean()
-        )
-    )
-
-    # 10. Payment-month gap CV: also diagnostic.
-    month_gap_features = (
-        monthly
-        .filter(pl.col("monthly_paid") > 0)
-        .select(ID_COLS + ["payment_month"])
-        .sort(ID_COLS + ["payment_month"])
-        .with_columns(
-            month_ordinal=(
-                pl.col("payment_month").dt.year() * 12
-                + pl.col("payment_month").dt.month()
-            )
-        )
-        .with_columns(
-            payment_month_gap=pl.col("month_ordinal").diff().over(ID_COLS)
-        )
-        .group_by(ID_COLS)
-        .agg(
-            payment_month_gap_cv=(
-                pl.col("payment_month_gap").std()
-                / pl.col("payment_month_gap").mean()
-            )
-        )
-    )
-
-    # 11. Final table + composite score.
-    result = (
-        credit_features
-        .join(bounds.select(ID_COLS + ["payoff_date"]), on=ID_COLS, how="left")
-        .join(monthly_features, on=ID_COLS, how="left")
-        .join(raw_gap_features, on=ID_COLS, how="left")
-        .join(month_gap_features, on=ID_COLS, how="left")
-        .with_columns(
+            is_fully_paid=(
+                pl.col("total_paid") >= amount_tolerance * pl.col("credit_amount")
+            ).cast(pl.Int8),
             dpd_score=1 / (1 + pl.col("weighted_mean_dpd") / 30),
-            shortfall_score=1 / (1 + pl.col("avg_cumulative_shortfall_installments")),
+            shortfall_score=1 / (1 + pl.col("avg_monthly_shortfall_ratio")),
         )
         .with_columns(
             regularity_score=100 * (
-                0.35 * pl.col("cumulative_coverage_auc")
-                + 0.25 * pl.col("amount_on_time_rate")
-                + 0.20 * pl.col("dpd_score")
-                + 0.20 * pl.col("shortfall_score")
+                0.30 * pl.col("avg_monthly_coverage_capped").fill_null(0)
+                + 0.25 * pl.col("monthly_adequacy_rate").fill_null(0)
+                + 0.25 * pl.col("amount_on_time_rate").fill_null(0)
+                + 0.20 * pl.col("dpd_score").fill_null(0)
             )
         )
     )

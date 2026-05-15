@@ -1,0 +1,164 @@
+import polars as pl
+
+# overdues:
+# local_date: Date
+# row_type: "OVERDUE START" / "OVERDUE END"
+# credit_id: Int
+# unique_app_id: Str
+
+# risk:
+# local_date: Date
+# pd: Float
+# unique_app_id: Str
+
+max_risk_date = risk.select(pl.col("local_date").max()).item()
+
+starts = (
+    overdues
+    .filter(pl.col("row_type") == "OVERDUE START")
+    .sort(["unique_app_id", "credit_id", "local_date"])
+    .with_columns(
+        overdue_no=pl.col("local_date")
+        .cum_count()
+        .over(["unique_app_id", "credit_id"])
+    )
+    .rename({"local_date": "overdue_start"})
+)
+
+ends = (
+    overdues
+    .filter(pl.col("row_type") == "OVERDUE END")
+    .sort(["unique_app_id", "credit_id", "local_date"])
+    .with_columns(
+        overdue_no=pl.col("local_date")
+        .cum_count()
+        .over(["unique_app_id", "credit_id"])
+    )
+    .rename({"local_date": "overdue_end"})
+)
+
+intervals = (
+    starts
+    .join(
+        ends.select(
+            "unique_app_id",
+            "credit_id",
+            "overdue_no",
+            "overdue_end",
+        ),
+        on=["unique_app_id", "credit_id", "overdue_no"],
+        how="left",
+    )
+    .with_columns(
+        pl.col("overdue_end").fill_null(max_risk_date)
+    )
+    .filter(pl.col("overdue_end") >= pl.col("overdue_start"))
+)
+
+
+events = pl.concat([
+    intervals.select(
+        "unique_app_id",
+        pl.col("overdue_start").alias("local_date"),
+        pl.lit(1).alias("delta"),
+    ),
+    intervals.select(
+        "unique_app_id",
+        # +1 day because overdue_end is inclusive
+        pl.col("overdue_end").dt.offset_by("1d").alias("local_date"),
+        pl.lit(-1).alias("delta"),
+    ),
+])
+
+
+events_cum = (
+    events
+    .group_by(["unique_app_id", "local_date"])
+    .agg(
+        pl.col("delta").sum()
+    )
+    .sort(["unique_app_id", "local_date"])
+    .with_columns(
+        active_overdues=pl.col("delta")
+        .cum_sum()
+        .over("unique_app_id")
+    )
+)
+
+
+risk_labeled = (
+    risk
+    .sort(["unique_app_id", "local_date"])
+    .join_asof(
+        events_cum.sort(["unique_app_id", "local_date"]),
+        on="local_date",
+        by="unique_app_id",
+        strategy="backward",
+    )
+    .with_columns(
+        pl.col("active_overdues").fill_null(0),
+    )
+    .with_columns(
+        is_overdue=pl.col("active_overdues") > 0
+    )
+)
+
+
+pd_comparison_by_client = (
+    risk_labeled
+    .group_by("unique_app_id")
+    .agg(
+        mean_pd_overall=pl.col("pd").mean(),
+
+        mean_pd_during_overdues=pl.col("pd")
+        .filter(pl.col("is_overdue"))
+        .mean(),
+
+        mean_pd_without_overdues=pl.col("pd")
+        .filter(~pl.col("is_overdue"))
+        .mean(),
+
+        n_risk_points=pl.len(),
+        n_risk_points_during_overdues=pl.col("is_overdue").sum(),
+        n_risk_points_without_overdues=(~pl.col("is_overdue")).sum(),
+    )
+    .with_columns(
+        pd_diff_overdue_vs_overall=
+            pl.col("mean_pd_during_overdues") - pl.col("mean_pd_overall"),
+
+        pd_diff_overdue_vs_without_overdues=
+            pl.col("mean_pd_during_overdues") - pl.col("mean_pd_without_overdues"),
+    )
+)
+
+
+pd_comparison_total = risk_labeled.select(
+    mean_pd_overall=pl.col("pd").mean(),
+
+    mean_pd_during_overdues=pl.col("pd")
+    .filter(pl.col("is_overdue"))
+    .mean(),
+
+    mean_pd_without_overdues=pl.col("pd")
+    .filter(~pl.col("is_overdue"))
+    .mean(),
+
+    n_risk_points=pl.len(),
+    n_risk_points_during_overdues=pl.col("is_overdue").sum(),
+    n_risk_points_without_overdues=(~pl.col("is_overdue")).sum(),
+).with_columns(
+    pd_diff_overdue_vs_overall=
+        pl.col("mean_pd_during_overdues") - pl.col("mean_pd_overall"),
+
+    pd_diff_overdue_vs_without_overdues=
+        pl.col("mean_pd_during_overdues") - pl.col("mean_pd_without_overdues"),
+)
+
+
+risk_daily = (
+    risk
+    .group_by(["unique_app_id", "local_date"])
+    .agg(
+        pd=pl.col("pd").mean()
+    )
+)

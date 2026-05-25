@@ -1,0 +1,252 @@
+import numpy as np
+import polars as pl
+
+
+def _prepare_arrays(
+    df: pl.DataFrame,
+    key_cols=("app id", "category"),
+    amount_col="amount",
+):
+    groups = (
+        df.select(key_cols)
+        .unique()
+        .with_row_index("_gid")
+    )
+
+    tmp = (
+        df.select(
+            [*key_cols, pl.col(amount_col).abs().cast(pl.Float64).alias("_y")]
+        )
+        .join(groups, on=list(key_cols), how="left")
+    )
+
+    y = tmp["_y"].to_numpy()
+    gid = tmp["_gid"].to_numpy()
+
+    return y, gid, groups.height
+
+
+def _eval_splits(
+    y: np.ndarray,
+    gid: np.ndarray,
+    n_groups: int,
+    splits,
+    representative="mean",
+    loss="relative_sse",
+    eps=1e-9,
+):
+    splits = np.array(sorted(splits), dtype=float)
+    n_bins = len(splits) + 1
+
+    bin_id = np.searchsorted(splits, y, side="right")
+
+    # counts[g, b] = number of rows in group g and bin b
+    flat = gid * n_bins + bin_id
+    counts = np.bincount(
+        flat,
+        minlength=n_groups * n_bins,
+    ).reshape(n_groups, n_bins).astype(float)
+
+    # true aggregate A_g
+    target = np.bincount(gid, weights=y, minlength=n_groups)
+
+    if representative == "mean":
+        bin_count = np.bincount(bin_id, minlength=n_bins).astype(float)
+        bin_sum = np.bincount(bin_id, weights=y, minlength=n_bins)
+
+        reps = np.divide(
+            bin_sum,
+            bin_count,
+            out=np.zeros_like(bin_sum),
+            where=bin_count > 0,
+        )
+
+    elif representative == "agg_lstsq":
+        # Choose representatives that minimize group-level aggregate error.
+        if loss == "relative_sse":
+            w = 1.0 / np.maximum(target, eps) ** 2
+        else:
+            w = np.ones_like(target)
+
+        sw = np.sqrt(w)
+        A = counts * sw[:, None]
+        b = target * sw
+
+        reps = np.linalg.lstsq(A, b, rcond=None)[0]
+
+        # Optional safety: keep reps inside observed bin ranges.
+        # This prevents weird representatives caused by ill-conditioned groups.
+        for j in range(n_bins):
+            mask = bin_id == j
+            if mask.any():
+                reps[j] = np.clip(reps[j], y[mask].min(), y[mask].max())
+
+    else:
+        raise ValueError("representative must be 'mean' or 'agg_lstsq'")
+
+    pred = counts @ reps
+
+    if loss == "relative_sse":
+        errors = (pred - target) / np.maximum(target, eps)
+        objective = np.mean(errors ** 2)
+    elif loss == "absolute_sse":
+        errors = pred - target
+        objective = np.mean(errors ** 2)
+    elif loss == "relative_mae":
+        errors = np.abs(pred - target) / np.maximum(target, eps)
+        objective = np.mean(errors)
+    else:
+        raise ValueError("Unknown loss")
+
+    return objective, reps, pred, target
+
+
+def find_aggregate_bins(
+    df: pl.DataFrame,
+    n_bins: int,
+    key_cols=("app id", "category"),
+    amount_col="amount",
+    n_candidates=300,
+    representative="mean",
+    loss="relative_sse",
+    min_bin_size=100,
+):
+    """
+    Returns:
+        splits: list[float]
+        representatives: list[float]
+        score: float
+    """
+
+    y, gid, n_groups = _prepare_arrays(df, key_cols, amount_col)
+
+    # Candidate split points.
+    # Quantile grid is much cheaper than trying every unique amount.
+    qs = np.linspace(0, 1, n_candidates + 2)[1:-1]
+    candidates = np.unique(np.quantile(y, qs))
+
+    candidates = candidates[
+        (candidates > y.min()) & (candidates < y.max())
+    ]
+
+    splits = []
+
+    best_obj, best_reps, _, _ = _eval_splits(
+        y,
+        gid,
+        n_groups,
+        splits,
+        representative=representative,
+        loss=loss,
+    )
+
+    for _ in range(n_bins - 1):
+        best_candidate = None
+        best_candidate_obj = best_obj
+        best_candidate_reps = best_reps
+
+        for c in candidates:
+            if any(np.isclose(c, s) for s in splits):
+                continue
+
+            trial_splits = sorted([*splits, float(c)])
+            trial_bin_id = np.searchsorted(trial_splits, y, side="right")
+
+            # Avoid tiny unstable bins.
+            bin_sizes = np.bincount(
+                trial_bin_id,
+                minlength=len(trial_splits) + 1,
+            )
+
+            if bin_sizes.min() < min_bin_size:
+                continue
+
+            obj, reps, _, _ = _eval_splits(
+                y,
+                gid,
+                n_groups,
+                trial_splits,
+                representative=representative,
+                loss=loss,
+            )
+
+            if obj < best_candidate_obj:
+                best_candidate = float(c)
+                best_candidate_obj = obj
+                best_candidate_reps = reps
+
+        if best_candidate is None:
+            break
+
+        splits = sorted([*splits, best_candidate])
+        best_obj = best_candidate_obj
+        best_reps = best_candidate_reps
+
+    final_obj, final_reps, pred, target = _eval_splits(
+        y,
+        gid,
+        n_groups,
+        splits,
+        representative=representative,
+        loss=loss,
+    )
+
+    if loss == "relative_sse":
+        score = float(np.sqrt(final_obj))  # relative RMSE
+    else:
+        score = float(final_obj)
+
+    return {
+        "splits": [float(x) for x in splits],
+        "representatives": [float(x) for x in final_reps],
+        "score": score,
+    }
+
+
+result = find_aggregate_bins(
+    df,
+    n_bins=20,
+    key_cols=("app id", "category"),
+    amount_col="amount",
+    representative="mean",       # start with this
+    loss="relative_sse",
+    n_candidates=500,
+    min_bin_size=100,
+)
+
+splits = result["splits"]
+reps = result["representatives"]
+
+print(splits)
+print(reps)
+print(result["score"])
+
+
+def bin_abs_amount_expr(amount_col, splits, reps):
+    splits_arr = np.array(splits, dtype=float)
+    reps_arr = np.array(reps, dtype=float)
+
+    def mapper(s: pl.Series) -> pl.Series:
+        y = np.abs(s.to_numpy())
+        bin_id = np.searchsorted(splits_arr, y, side="right")
+        return pl.Series(reps_arr[bin_id])
+
+    return pl.col(amount_col).map_batches(
+        mapper,
+        return_dtype=pl.Float64,
+    )
+
+
+df_binned = df.with_columns(
+    bin_abs_amount_expr("amount", splits, reps).alias("amount_binned_abs")
+)
+
+aggs_true = (
+    df.group_by("app id", "category")
+    .agg(pl.col("amount").abs().sum().alias("true_amount"))
+)
+
+aggs_binned = (
+    df_binned.group_by("app id", "category")
+    .agg(pl.col("amount_binned_abs").sum().alias("binned_amount"))
+)

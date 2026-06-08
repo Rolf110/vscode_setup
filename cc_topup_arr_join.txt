@@ -1,0 +1,133 @@
+"""
+Join main transaction data with additional credit data (Part 1).
+
+Both sources are dict[str, np.ndarray].  The result is the main dict with new
+transaction-level arrays appended (same length as the existing main arrays);
+unmatched / unfiltered transactions are filled with NaN (NaT / None for
+non-numeric columns).
+"""
+
+from __future__ import annotations
+import numpy as np
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+def _to_day(arr) -> np.ndarray:
+    """Coerce datetime / object / string arrays to day-granularity datetime64[D]."""
+    a = np.asarray(arr)
+    if np.issubdtype(a.dtype, np.datetime64):
+        return a.astype("datetime64[D]")
+    try:
+        return a.astype("datetime64[D]")
+    except (ValueError, TypeError):
+        import pandas as pd  # fallback for exotic formats
+        return pd.to_datetime(a).to_numpy().astype("datetime64[D]")
+
+
+def _empty_like(src: np.ndarray, n: int) -> np.ndarray:
+    """Allocate an output array of length n pre-filled with the right 'missing' value."""
+    a = np.asarray(src)
+    if np.issubdtype(a.dtype, np.floating) or np.issubdtype(a.dtype, np.integer):
+        # ints can't hold NaN -> represent gaps as float64 NaN
+        return np.full(n, np.nan, dtype=np.float64)
+    if np.issubdtype(a.dtype, np.datetime64):
+        return np.full(n, np.datetime64("NaT"), dtype=a.dtype)
+    # strings, dicts, fct_payment_arrays, etc.
+    return np.full(n, np.nan, dtype=object)
+
+
+# --------------------------------------------------------------------------- #
+# Part 1
+# --------------------------------------------------------------------------- #
+def join_transactions_with_credits(
+    main: dict[str, np.ndarray],
+    add: dict[str, np.ndarray],
+    new_keys: list[str] | None = None,
+    threshold: float = 0.0,
+    *,
+    # --- main-side filter (see note: spec said cust_agr_sid=="CC", but that is
+    #     the <U2 card-type code, not the 32-char agreement sid) ---
+    filter_col: str = "cust_trans_card_type_code",
+    filter_val: str = "CC",
+    # --- join columns ---
+    main_sid_col: str = "cust_agr_sid",
+    main_date_col: str = "cust_trans_date",
+    main_amt_col: str = "cust_trans_rub_amt",
+    add_sid_col: str = "agr_cred_sid",
+    add_date_col: str = "cred_begin_dt",
+    add_amt_col: str = "cred_initial_sum",
+    cred_type_col: str = "cred_type_code",
+    cred_type_value: int = 3,
+    # --- behaviour ---
+    multi_match: str = "closest",   # "closest" (min |amount diff|) or "first"
+    prefix: str = "",               # prepend to new key names to avoid collisions
+) -> dict[str, np.ndarray]:
+    """
+    Returns a NEW dict = main (originals untouched) + the requested joined keys.
+
+    new_keys : which additional-source keys to bring over. None -> every key in `add`.
+    threshold: max |daily_abs_sum - cred_initial_sum| allowed for a match.
+    """
+    n_main = len(main[main_sid_col])
+    if new_keys is None:
+        new_keys = list(add.keys())
+
+    # 1. convert additional data to joinable dtypes ------------------------- #
+    add_sid   = np.asarray(add[add_sid_col]).astype("U32")
+    add_day   = _to_day(add[add_date_col])
+    add_sum   = np.asarray(add[add_amt_col]).astype(np.float64)
+    add_ctype = np.asarray(add[cred_type_col]).astype(np.int64)
+
+    # 2. filter additional data by cred_type_code == 3, build a lookup ------ #
+    #    (only these indexes are eligible -> their fct_payment_arrays are the
+    #     ones that get picked when a transaction matches)
+    elig = np.flatnonzero(add_ctype == cred_type_value)
+    add_lookup: dict[tuple, list[tuple[int, float]]] = {}
+    for i in elig:
+        add_lookup.setdefault((add_sid[i], add_day[i]), []).append((int(i), add_sum[i]))
+
+    # 3. filter main transactions: card type == "CC" AND amount > 0 --------- #
+    main_amt = np.asarray(main[main_amt_col]).astype(np.float64)
+    keep = np.flatnonzero((np.asarray(main[filter_col]) == filter_val) & (main_amt > 0))
+
+    main_sid = np.asarray(main[main_sid_col]).astype("U32")
+    main_day = _to_day(main[main_date_col])
+
+    # 4. daily aggregation: abs-sum per (sid, day) over the kept rows -------- #
+    group_rows: dict[tuple, list[int]] = {}   # (sid, day) -> original tx indexes
+    group_sum:  dict[tuple, float]     = {}   # (sid, day) -> sum(|amount|)
+    for i in keep:
+        key = (main_sid[i], main_day[i])
+        group_rows.setdefault(key, []).append(int(i))
+        group_sum[key] = group_sum.get(key, 0.0) + abs(main_amt[i])
+
+    # 5. join each daily group to an eligible credit ------------------------ #
+    #    keys: sid==agr_cred_sid, day==cred_begin_dt, |sum-initial_sum|<=thr
+    matched: dict[tuple, int] = {}            # (sid, day) -> chosen add index
+    for key, dsum in group_sum.items():
+        best_idx, best_diff = None, None
+        for add_idx, init_sum in add_lookup.get(key, ()):
+            diff = abs(dsum - init_sum)
+            if diff <= threshold:
+                if multi_match == "first":
+                    best_idx = add_idx
+                    break
+                if best_diff is None or diff < best_diff:
+                    best_idx, best_diff = add_idx, diff
+        if best_idx is not None:
+            matched[key] = best_idx
+
+    # 6. scatter matched credit values back to transaction level ------------ #
+    out = dict(main)                          # keep all original keys/arrays
+    for k in new_keys:
+        src = np.asarray(add[k])
+        col = _empty_like(src, n_main)
+        for key, add_idx in matched.items():
+            val = src[add_idx]
+            for row in group_rows[key]:
+                col[row] = val
+        out[prefix + k] = col
+
+    return out

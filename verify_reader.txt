@@ -1,0 +1,358 @@
+from __future__ import annotations
+
+import os
+import pickle
+import random
+import threading
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+from tqdm.auto import tqdm
+
+
+_CHECKPOINT_VERSION = 1
+
+
+def _create_checkpoint(
+    path: Path,
+    header: dict[str, Any],
+) -> None:
+    """
+    Create the initial checkpoint atomically.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Keep the temporary file in the same directory so os.replace()
+    # does not cross filesystem boundaries.
+    tmp_path = path.with_name(path.name + ".tmp")
+
+    with tmp_path.open("wb") as file:
+        pickle.dump(
+            header,
+            file,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+        file.flush()
+        os.fsync(file.fileno())
+
+    os.replace(tmp_path, path)
+
+
+def _append_checkpoint_record(
+    path: Path,
+    record: dict[str, Any],
+) -> None:
+    """
+    Append one completed batch.
+
+    This function must only be called from the main thread.
+    """
+    with path.open("ab") as file:
+        pickle.dump(
+            record,
+            file,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+        file.flush()
+        os.fsync(file.fileno())
+
+
+def _read_checkpoint_records(
+    path: Path,
+) -> list[dict[str, Any]]:
+    """
+    Load all complete records from the append-only checkpoint.
+
+    If execution stopped during the final pickle.dump(), only the incomplete
+    final record is removed. All fully saved batches remain intact.
+    """
+    records: list[dict[str, Any]] = []
+
+    with path.open("rb+") as file:
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        file.seek(0)
+
+        while file.tell() < file_size:
+            record_start = file.tell()
+
+            try:
+                record = pickle.load(file)
+            except (EOFError, pickle.UnpicklingError):
+                # The last record was probably interrupted during writing.
+                file.seek(record_start)
+                file.truncate()
+                break
+
+            if not isinstance(record, dict):
+                raise ValueError(
+                    "Invalid checkpoint record at byte offset "
+                    f"{record_start}."
+                )
+
+            records.append(record)
+
+    return records
+
+
+def collect_join_metrics(
+    app_ids: Iterable[Any],
+    *,
+    reader: Any | None = None,
+    reader_factory: Callable[[], Any] | None = None,
+    k: int = 1_000_000,
+    checkpoint_path: str | os.PathLike[str] = "join_metrics.ckpt.pkl",
+    checkpoint_every: int = 5_000,
+    max_workers: int = 16,
+    seed: int = 42,
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    """
+    Randomly sample app IDs with replacement and load their join metrics.
+
+    Features:
+    - concurrent reading with ThreadPoolExecutor;
+    - append-only partial checkpoints;
+    - automatic resume;
+    - deterministic sampling after resume;
+    - checkpoint writes only from the main thread;
+    - preservation of sampled-result order within each batch.
+
+    Reader options
+    --------------
+    reader:
+        A reader instance that is safe to access from multiple threads.
+
+    reader_factory:
+        A callable that creates a separate reader for each worker thread.
+        Use this when the reader is not thread-safe.
+
+    Returns
+    -------
+    metrics:
+        Successfully loaded join metrics.
+
+    errors:
+        Error information for failed applications.
+    """
+    if (reader is None) == (reader_factory is None):
+        raise ValueError(
+            "Provide exactly one of `reader` or `reader_factory`."
+        )
+
+    if k < 0:
+        raise ValueError("`k` must be non-negative.")
+
+    if checkpoint_every <= 0:
+        raise ValueError("`checkpoint_every` must be positive.")
+
+    if max_workers <= 0:
+        raise ValueError("`max_workers` must be positive.")
+
+    population = tuple(app_ids)
+
+    if not population and k > 0:
+        raise ValueError("`app_ids` cannot be empty when k > 0.")
+
+    checkpoint_path = Path(checkpoint_path)
+    rng = random.Random(seed)
+
+    metrics: list[Any] = []
+    errors: list[dict[str, Any]] = []
+
+    processed = 0
+    batch_index = 0
+
+    # ------------------------------------------------------------
+    # Restore or initialize checkpoint
+    # ------------------------------------------------------------
+
+    if checkpoint_path.exists():
+        records = _read_checkpoint_records(checkpoint_path)
+
+        if not records or records[0].get("kind") != "header":
+            raise ValueError(
+                f"Invalid checkpoint file: {checkpoint_path}"
+            )
+
+        header = records[0]
+
+        expected_config = {
+            "version": _CHECKPOINT_VERSION,
+            "target_k": k,
+            "seed": seed,
+            "population_size": len(population),
+        }
+
+        actual_config = {
+            key: header.get(key)
+            for key in expected_config
+        }
+
+        if actual_config != expected_config:
+            raise ValueError(
+                "Checkpoint configuration does not match the current run.\n"
+                f"Expected: {expected_config}\n"
+                f"Found:    {actual_config}"
+            )
+
+        rng.setstate(header["rng_state"])
+
+        for record in records[1:]:
+            if record.get("kind") != "batch":
+                raise ValueError(
+                    "Invalid checkpoint: unexpected record type."
+                )
+
+            if record.get("batch_index") != batch_index:
+                raise ValueError(
+                    "Invalid checkpoint: batch indices are not contiguous."
+                )
+
+            batch_metrics = record["metrics"]
+            batch_errors = record["errors"]
+
+            metrics.extend(batch_metrics)
+            errors.extend(batch_errors)
+
+            processed += record["processed_in_batch"]
+            rng.setstate(record["rng_state"])
+
+            batch_index += 1
+
+    else:
+        header = {
+            "kind": "header",
+            "version": _CHECKPOINT_VERSION,
+            "target_k": k,
+            "seed": seed,
+            "population_size": len(population),
+            "rng_state": rng.getstate(),
+        }
+
+        _create_checkpoint(checkpoint_path, header)
+
+    if processed > k:
+        raise ValueError(
+            f"Checkpoint contains {processed} processed items, "
+            f"but k={k}."
+        )
+
+    # ------------------------------------------------------------
+    # Reader management
+    # ------------------------------------------------------------
+
+    thread_local = threading.local()
+
+    def get_reader() -> Any:
+        if reader_factory is None:
+            return reader
+
+        # Each worker thread lazily creates and reuses its own reader.
+        if not hasattr(thread_local, "reader"):
+            thread_local.reader = reader_factory()
+
+        return thread_local.reader
+
+    def read_one(
+        app: Any,
+    ) -> tuple[Any | None, dict[str, Any] | None]:
+        try:
+            data = get_reader()[app]
+            return data["join_metrics"], None
+
+        except Exception as exc:
+            # Store strings rather than the exception object itself because
+            # arbitrary exception objects may not be pickleable.
+            return None, {
+                "app_id": app,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+
+    # ------------------------------------------------------------
+    # Concurrent processing
+    # ------------------------------------------------------------
+
+    with tqdm(
+        total=k,
+        initial=processed,
+        desc="Reading applications",
+    ) as progress:
+        with ThreadPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+            while processed < k:
+                batch_size = min(
+                    checkpoint_every,
+                    k - processed,
+                )
+
+                # Sampling happens only in the main thread.
+                batch_apps = [
+                    rng.choice(population)
+                    for _ in range(batch_size)
+                ]
+
+                batch_results: list[
+                    tuple[Any | None, dict[str, Any] | None] | None
+                ] = [None] * batch_size
+
+                future_to_index = {
+                    executor.submit(read_one, app): index
+                    for index, app in enumerate(batch_apps)
+                }
+
+                for future in as_completed(future_to_index):
+                    index = future_to_index[future]
+                    batch_results[index] = future.result()
+                    progress.update(1)
+
+                batch_metrics: list[Any] = []
+                batch_errors: list[dict[str, Any]] = []
+
+                # Iterate in sampled-app order, not completion order.
+                for result in batch_results:
+                    if result is None:
+                        raise RuntimeError(
+                            "A worker completed without producing a result."
+                        )
+
+                    metric, error = result
+
+                    if error is None:
+                        batch_metrics.append(metric)
+                    else:
+                        batch_errors.append(error)
+
+                # Only the main thread mutates the aggregate lists.
+                metrics.extend(batch_metrics)
+                errors.extend(batch_errors)
+
+                # Save only the newly completed batch.
+                checkpoint_record = {
+                    "kind": "batch",
+                    "batch_index": batch_index,
+                    "processed_in_batch": batch_size,
+                    "metrics": batch_metrics,
+                    "errors": batch_errors,
+                    "rng_state": rng.getstate(),
+                }
+
+                # No worker thread can write to the checkpoint.
+                _append_checkpoint_record(
+                    checkpoint_path,
+                    checkpoint_record,
+                )
+
+                processed += batch_size
+                batch_index += 1
+
+                progress.set_postfix(
+                    successes=len(metrics),
+                    errors=len(errors),
+                )
+
+    return metrics, errors

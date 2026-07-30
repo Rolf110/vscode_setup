@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+
+shopt -s nullglob
+
+output_dir="/path/to/output"
+mkdir -p "$output_dir"
+
+# Multipart archives: archive.zip.001, archive.zip.002, ...
+for first in *.zip.001; do
+    base="${first%.001}"
+    name="${base%.zip}"
+    combined="/tmp/${name}.zip"
+
+    cat $(printf '%s\n' "$base".[0-9]* | sort -V) > "$combined"
+    unzip "$combined" -d "$output_dir"
+    rm -f "$combined"
+done
+
+# Regular standalone archives: archive.zip
+for archive in *.zip; do
+    [[ -e "$archive.001" ]] && continue
+    unzip "$archive" -d "$output_dir"
+done

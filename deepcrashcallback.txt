@@ -1,0 +1,151 @@
+import os
+import socket
+import traceback
+
+import torch
+import torch.distributed as dist
+import pytorch_lightning as pl
+
+
+class DeepCrashCallback(pl.Callback):
+    """
+    Multi-GPU/node crash callback — zero overhead during normal training.
+
+    Per-step hooks only store tensor REFERENCES (no .cpu(), no isnan checks,
+    no sync). All expensive work (CPU transfer, grad inspection, model state
+    capture) happens once, inside on_exception, after the crash.
+    """
+
+    def __init__(self, save_dir: str = "crash_dumps", save_weights: bool = False):
+        self.save_dir = save_dir
+        self.save_weights = save_weights  # default False — state_dict dumps are large + slow to write
+
+    # ------------------------------------------------------------------
+    # lightweight per-step stashing — reference assignment only
+    # ------------------------------------------------------------------
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        pl_module._debug = {
+            "global_rank": trainer.global_rank,
+            "local_rank":  trainer.local_rank,
+            "node_rank":   trainer.node_rank,
+            "hostname":    socket.gethostname(),
+            "batch_ref":   batch,      # GPU reference — no copy
+            "batch_idx":   batch_idx,
+            "logits_ref":  None,
+            "loss_ref":    None,
+        }
+
+    def on_before_backward(self, trainer, pl_module, loss):
+        pl_module._debug["loss_ref"] = loss  # reference only
+
+    # NOTE: on_after_backward intentionally removed — scanning every
+    # param's grad for NaN/Inf every step forces a device sync and
+    # is the most expensive thing in the old version. Grad inspection
+    # now happens only at crash time, below.
+
+    # ------------------------------------------------------------------
+    # helpers — all best-effort, isolated per tensor
+    # ------------------------------------------------------------------
+
+    def _dump_path(self, trainer, prefix="crash") -> str:
+        return os.path.join(
+            self.save_dir,
+            f"{prefix}_step{trainer.global_step}"
+            f"_rank{trainer.global_rank}_{socket.gethostname()}.pt",
+        )
+
+    @staticmethod
+    def _safe_cpu(tensor, name="tensor"):
+        """
+        Try to move a tensor to CPU. After a CUDA device-side assert
+        (exactly your cross_entropy case), the CUDA context is often
+        poisoned and ANY subsequent CUDA call — including this transfer —
+        can itself raise. Isolate failures so one bad tensor doesn't
+        wipe out the rest of the dump.
+        """
+        try:
+            return tensor.detach().cpu()
+        except Exception as e:
+            return f"<failed to transfer '{name}' to CPU: {e}>"
+
+    def _capture_model_state(self, trainer, pl_module):
+        if not self.save_weights:
+            return None
+
+        strategy = trainer.strategy.__class__.__name__
+        try:
+            if "FSDP" in strategy:
+                return {
+                    "strategy": strategy,
+                    "note": "local shard only — merge offline via torch.distributed.checkpoint",
+                    "local_shard": {
+                        name: self._safe_cpu(p, name)
+                        for name, p in pl_module.named_parameters()
+                    },
+                }
+            if "DeepSpeed" in strategy:
+                return {"strategy": strategy, "note": "use DeepSpeed checkpoint utils offline"}
+            return {k: self._safe_cpu(v, k) for k, v in pl_module.state_dict().items()}
+        except Exception as e:
+            return f"<model state capture failed: {e}>"
+
+    # ------------------------------------------------------------------
+    # crash handler — the ONLY place expensive work happens
+    # ------------------------------------------------------------------
+
+    def on_exception(self, trainer, pl_module, exception):
+        os.makedirs(self.save_dir, exist_ok=True)
+        d = getattr(pl_module, "_debug", {})
+        path = self._dump_path(trainer)
+
+        payload = {
+            "step":        trainer.global_step,
+            "epoch":       trainer.current_epoch,
+            "global_rank": trainer.global_rank,
+            "hostname":    socket.gethostname(),
+            "exception":   str(exception),
+            "traceback":   traceback.format_exc(),
+            "batch_idx":   d.get("batch_idx"),
+        }
+
+        # Batch — most important for your OOB-label case
+        batch_ref = d.get("batch_ref")
+        if isinstance(batch_ref, dict):
+            payload["batch"] = {
+                k: self._safe_cpu(v, k) if isinstance(v, torch.Tensor) else v
+                for k, v in batch_ref.items()
+            }
+        elif isinstance(batch_ref, torch.Tensor):
+            payload["batch"] = self._safe_cpu(batch_ref, "batch")
+        else:
+            payload["batch"] = batch_ref
+
+        logits_ref = d.get("logits_ref")
+        payload["logits"] = self._safe_cpu(logits_ref, "logits") if logits_ref is not None else None
+
+        loss_ref = d.get("loss_ref")
+        payload["loss"] = self._safe_cpu(loss_ref, "loss") if loss_ref is not None else None
+
+        # Grad inspection — only here, once, not every step
+        try:
+            bad_grads = []
+            for name, p in pl_module.named_parameters():
+                if p.grad is not None:
+                    g = self._safe_cpu(p.grad, name)
+                    if isinstance(g, torch.Tensor) and (torch.isnan(g).any() or torch.isinf(g).any()):
+                        bad_grads.append(name)
+            payload["bad_grad_names"] = bad_grads
+        except Exception as e:
+            payload["bad_grad_names"] = f"<grad scan failed: {e}>"
+
+        payload["model_state"] = self._capture_model_state(trainer, pl_module)
+
+        torch.save(payload, path)
+        print(f"[CRASH] Rank {trainer.global_rank} dumped → {path}")
+
+        sentinel = os.path.join(
+            self.save_dir, f"CRASH_SENTINEL_step{trainer.global_step}_rank{trainer.global_rank}.flag"
+        )
+        with open(sentinel, "w") as f:
+            f.write(f"{str(exception)}\n{traceback.format_exc()}")

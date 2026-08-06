@@ -1,54 +1,58 @@
-import os
-import socket
-import traceback
-
+import os, socket, traceback
 import torch
-import torch.distributed as dist
 import pytorch_lightning as pl
 
 
 class DeepCrashCallback(pl.Callback):
     """
-    Multi-GPU/node crash callback — zero overhead during normal training.
+    Zero-overhead crash dump for multi-GPU/node training.
 
-    Per-step hooks only store tensor REFERENCES (no .cpu(), no isnan checks,
-    no sync). All expensive work (CPU transfer, grad inspection, model state
-    capture) happens once, inside on_exception, after the crash.
+    REQUIRES this hook on your LightningModule (or LightningDataModule):
+
+        def on_before_batch_transfer(self, batch, dataloader_idx):
+            self._cpu_batch = batch
+            return batch
+
+    Without it, batches are unrecoverable after sticky CUDA errors
+    (illegal memory access, device-side assert).
     """
 
-    def __init__(self, save_dir: str = "crash_dumps", save_weights: bool = False):
+    def __init__(self, save_dir="crash_dumps", save_weights=False):
         self.save_dir = save_dir
-        self.save_weights = save_weights  # default False — state_dict dumps are large + slow to write
+        self.save_weights = save_weights
 
-    # ------------------------------------------------------------------
-    # lightweight per-step stashing — reference assignment only
-    # ------------------------------------------------------------------
+    # ---- setup check: fail loudly if the hook is missing -------------
+
+    def setup(self, trainer, pl_module, stage):
+        if stage != "fit":
+            return
+        dm = getattr(trainer, "datamodule", None)
+        has_hook = any(
+            type(obj).on_before_batch_transfer is not pl.LightningModule.on_before_batch_transfer
+            for obj in (pl_module, dm) if obj is not None
+        )
+        if not has_hook:
+            rank_zero_warn = pl.utilities.rank_zero.rank_zero_warn
+            rank_zero_warn(
+                "[DeepCrashCallback] on_before_batch_transfer is not defined. "
+                "Batches will NOT be recoverable after sticky CUDA errors."
+            )
+
+    # ---- per-step: reference assignment only, no copies, no syncs ----
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         pl_module._debug = {
-            "global_rank": trainer.global_rank,
-            "local_rank":  trainer.local_rank,
-            "node_rank":   trainer.node_rank,
-            "hostname":    socket.gethostname(),
-            "batch_ref":   batch,      # GPU reference — no copy
-            "batch_idx":   batch_idx,
-            "logits_ref":  None,
-            "loss_ref":    None,
+            "batch_idx": batch_idx,
+            "batch_ref": batch,
+            "loss_ref":  None,
         }
 
     def on_before_backward(self, trainer, pl_module, loss):
-        pl_module._debug["loss_ref"] = loss  # reference only
+        pl_module._debug["loss_ref"] = loss
 
-    # NOTE: on_after_backward intentionally removed — scanning every
-    # param's grad for NaN/Inf every step forces a device sync and
-    # is the most expensive thing in the old version. Grad inspection
-    # now happens only at crash time, below.
+    # ---- helpers -----------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # helpers — all best-effort, isolated per tensor
-    # ------------------------------------------------------------------
-
-    def _dump_path(self, trainer, prefix="crash") -> str:
+    def _dump_path(self, trainer, prefix="crash"):
         return os.path.join(
             self.save_dir,
             f"{prefix}_step{trainer.global_step}"
@@ -56,43 +60,39 @@ class DeepCrashCallback(pl.Callback):
         )
 
     @staticmethod
-    def _safe_cpu(tensor, name="tensor"):
-        """
-        Try to move a tensor to CPU. After a CUDA device-side assert
-        (exactly your cross_entropy case), the CUDA context is often
-        poisoned and ANY subsequent CUDA call — including this transfer —
-        can itself raise. Isolate failures so one bad tensor doesn't
-        wipe out the rest of the dump.
-        """
+    def _safe_cpu(t, name="tensor"):
+        if t is None:
+            return None
         try:
-            return tensor.detach().cpu()
+            return t.detach().cpu()
         except Exception as e:
-            return f"<failed to transfer '{name}' to CPU: {e}>"
+            return f"<transfer failed '{name}': {type(e).__name__}: {e}>"
+
+    def _safe_cpu_tree(self, obj, name="root"):
+        if isinstance(obj, torch.Tensor):
+            return self._safe_cpu(obj, name)
+        if isinstance(obj, dict):
+            return {k: self._safe_cpu_tree(v, k) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(self._safe_cpu_tree(v, f"{name}[{i}]") for i, v in enumerate(obj))
+        return obj
 
     def _capture_model_state(self, trainer, pl_module):
-        if not self.save_weights:
-            return None
-
         strategy = trainer.strategy.__class__.__name__
         try:
             if "FSDP" in strategy:
                 return {
                     "strategy": strategy,
-                    "note": "local shard only — merge offline via torch.distributed.checkpoint",
-                    "local_shard": {
-                        name: self._safe_cpu(p, name)
-                        for name, p in pl_module.named_parameters()
-                    },
+                    "note": "local shard only",
+                    "local_shard": {n: self._safe_cpu(p, n) for n, p in pl_module.named_parameters()},
                 }
             if "DeepSpeed" in strategy:
                 return {"strategy": strategy, "note": "use DeepSpeed checkpoint utils offline"}
             return {k: self._safe_cpu(v, k) for k, v in pl_module.state_dict().items()}
         except Exception as e:
-            return f"<model state capture failed: {e}>"
+            return f"<model state capture failed: {type(e).__name__}: {e}>"
 
-    # ------------------------------------------------------------------
-    # crash handler — the ONLY place expensive work happens
-    # ------------------------------------------------------------------
+    # ---- crash handler ------------------------------------------------
 
     def on_exception(self, trainer, pl_module, exception):
         os.makedirs(self.save_dir, exist_ok=True)
@@ -103,49 +103,37 @@ class DeepCrashCallback(pl.Callback):
             "step":        trainer.global_step,
             "epoch":       trainer.current_epoch,
             "global_rank": trainer.global_rank,
+            "local_rank":  trainer.local_rank,
             "hostname":    socket.gethostname(),
-            "exception":   str(exception),
+            "exception":   f"{type(exception).__name__}: {exception}",
             "traceback":   traceback.format_exc(),
             "batch_idx":   d.get("batch_idx"),
+            # reliable — already on host
+            "cpu_batch":   getattr(pl_module, "_cpu_batch", None),
         }
 
-        # Batch — most important for your OOB-label case
-        batch_ref = d.get("batch_ref")
-        if isinstance(batch_ref, dict):
-            payload["batch"] = {
-                k: self._safe_cpu(v, k) if isinstance(v, torch.Tensor) else v
-                for k, v in batch_ref.items()
-            }
-        elif isinstance(batch_ref, torch.Tensor):
-            payload["batch"] = self._safe_cpu(batch_ref, "batch")
-        else:
-            payload["batch"] = batch_ref
+        # best-effort — works for Python-level exceptions, fails on sticky CUDA
+        payload["gpu_batch"] = self._safe_cpu_tree(d.get("batch_ref"), "batch")
+        payload["loss"]      = self._safe_cpu(d.get("loss_ref"), "loss")
 
-        logits_ref = d.get("logits_ref")
-        payload["logits"] = self._safe_cpu(logits_ref, "logits") if logits_ref is not None else None
-
-        loss_ref = d.get("loss_ref")
-        payload["loss"] = self._safe_cpu(loss_ref, "loss") if loss_ref is not None else None
-
-        # Grad inspection — only here, once, not every step
         try:
-            bad_grads = []
-            for name, p in pl_module.named_parameters():
-                if p.grad is not None:
-                    g = self._safe_cpu(p.grad, name)
-                    if isinstance(g, torch.Tensor) and (torch.isnan(g).any() or torch.isinf(g).any()):
-                        bad_grads.append(name)
-            payload["bad_grad_names"] = bad_grads
+            payload["bad_grad_names"] = [
+                n for n, p in pl_module.named_parameters()
+                if p.grad is not None
+                and isinstance(g := self._safe_cpu(p.grad, n), torch.Tensor)
+                and (torch.isnan(g).any() or torch.isinf(g).any())
+            ]
         except Exception as e:
             payload["bad_grad_names"] = f"<grad scan failed: {e}>"
 
-        payload["model_state"] = self._capture_model_state(trainer, pl_module)
+        if self.save_weights:
+            payload["model_state"] = self._capture_model_state(trainer, pl_module)
 
         torch.save(payload, path)
-        print(f"[CRASH] Rank {trainer.global_rank} dumped → {path}")
+        print(f"[CRASH] rank {trainer.global_rank} → {path}", flush=True)
 
-        sentinel = os.path.join(
-            self.save_dir, f"CRASH_SENTINEL_step{trainer.global_step}_rank{trainer.global_rank}.flag"
-        )
-        with open(sentinel, "w") as f:
-            f.write(f"{str(exception)}\n{traceback.format_exc()}")
+        with open(os.path.join(
+            self.save_dir,
+            f"CRASH_SENTINEL_step{trainer.global_step}_rank{trainer.global_rank}.flag"
+        ), "w") as f:
+            f.write(payload["traceback"])

@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+import numpy as np
+from typing import Any
+
+
+def missing_mask(
+    x: np.ndarray,
+    *,
+    datetime_extremes_as_missing: bool = True,
+    extra_missing: tuple[Any, ...] = (),
+) -> np.ndarray:
+    x = np.asarray(x)
+
+    # float / complex
+    if np.issubdtype(x.dtype, np.inexact):
+        # catches NaN, +inf, -inf
+        mask = ~np.isfinite(x)
+
+    # datetime64
+    elif np.issubdtype(x.dtype, np.datetime64):
+        mask = np.isnat(x)
+
+        if datetime_extremes_as_missing:
+            info = np.iinfo(x.dtype)
+            # Useful if your datasets use extreme timestamps as sentinels.
+            mask |= (x.view("i8") == info.min)
+            mask |= (x.view("i8") == info.max)
+
+    # timedelta64
+    elif np.issubdtype(x.dtype, np.timedelta64):
+        mask = np.isnat(x)
+
+    # object arrays: None, nan, NaT, etc.
+    elif x.dtype == object:
+        mask = np.fromiter(
+            (_is_missing_object(v) for v in x.flat),
+            dtype=bool,
+            count=x.size,
+        ).reshape(x.shape)
+
+    # int / bool / strings have no intrinsic missing value
+    else:
+        mask = np.zeros(x.shape, dtype=bool)
+
+    for value in extra_missing:
+        mask |= x == value
+
+    return mask
+
+
+def _is_missing_object(v: Any) -> bool:
+    if v is None:
+        return True
+
+    if isinstance(v, (float, complex)):
+        return not np.isfinite(v)
+
+    if isinstance(v, (np.datetime64, np.timedelta64)):
+        return np.isnat(v)
+
+    return False
+
+
+def array_meta(x: np.ndarray, **missing_kwargs) -> dict:
+    x = np.asarray(x)
+    mask = missing_mask(x, **missing_kwargs)
+    valid = x[~mask]
+
+    result = {
+        "dtype": str(x.dtype),
+        "len": x.size,
+        "n_missing": int(mask.sum()),
+        "missing_pct": float(mask.mean()) if x.size else 0.0,
+        "n_unique": int(np.unique(valid).size) if valid.size else 0,
+    }
+
+    if valid.size:
+        result["min"] = valid.min()
+        result["max"] = valid.max()
+    else:
+        result["min"] = None
+        result["max"] = None
+
+    return result
+
+
+def missing_mask(
+    x,
+    *,
+    datetime_min=None,
+    datetime_max=None,
+    extra_missing=(),
+):
+    x = np.asarray(x)
+
+    if np.issubdtype(x.dtype, np.inexact):
+        mask = ~np.isfinite(x)
+
+    elif np.issubdtype(x.dtype, np.datetime64):
+        mask = np.isnat(x)
+
+        if datetime_min is not None:
+            mask |= x <= np.datetime64(datetime_min)
+
+        if datetime_max is not None:
+            mask |= x >= np.datetime64(datetime_max)
+
+    elif np.issubdtype(x.dtype, np.timedelta64):
+        mask = np.isnat(x)
+
+    elif x.dtype == object:
+        mask = np.fromiter(
+            (_is_missing_object(v) for v in x.flat),
+            dtype=bool,
+            count=x.size,
+        ).reshape(x.shape)
+
+    else:
+        mask = np.zeros(x.shape, dtype=bool)
+
+    for sentinel in extra_missing:
+        mask |= x == sentinel
+
+    return mask

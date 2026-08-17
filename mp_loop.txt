@@ -1,0 +1,314 @@
+"""
+run_processing.py — resumable, parallel batch processing over pkl.z shards.
+
+WHAT YOU PROVIDE (in the module named by `Config.processing_module`):
+
+    process_id(app_id: str, data: Any) -> dict[str, np.ndarray]
+    SCHEMA: dict[str, pl.DataType]        # the polars table layout
+
+    SCHEMA defines the table: its keys are the columns written, in order, and
+    `process_id` must return every one of them. Extra keys are ignored.
+
+OUTPUT
+
+    <out_dir>/worker_<N>/<table_prefix>_part_<batch_idx>.parquet
+
+RESUME
+    Every batch is one file, written to a `.tmp` name and renamed on success.
+    Rename is atomic, so a file existing means it is complete — a killed job
+    leaves at most a `.tmp`, which the next run overwrites. Rerun the same
+    command and it processes only what is missing.
+
+    `batch_idx` is DERIVED, not counted: each worker reads its shards' indexes
+    (cheap — no data file is opened) and computes each shard's starting index
+    from the record counts before it. A running counter would renumber every
+    batch after a skipped shard, so a resume would rewrite the whole dataset
+    under different names. The cost of deriving it is that the numbering is
+    only stable while `n_workers`, `batch_size` and the shard list are — change
+    any of them and you must start from an empty out_dir.
+
+    A shard whose batch files all exist is skipped without opening its data
+    file. A partially done shard is re-read, but its finished batches are not
+    rewritten.
+
+POLARS + MULTIPROCESSING
+    polars starts a Rust (rayon) thread pool at import. `fork()` copies only
+    the calling thread, so locks those threads held stay locked in the child,
+    which hangs on its first polars call — reproducibly, even when the parent
+    merely IMPORTS polars and never uses it. Only "forkserver" (default) and
+    "spawn" are safe, and the method is pinned here rather than inherited
+    because the platform default differs (fork on Linux for Python < 3.14,
+    spawn on macOS) — that is how this passes on a laptop and hangs in prod.
+
+    Each worker also builds its own polars pool sized to the whole machine, so
+    `POLARS_MAX_THREADS` is set in the parent environment before the children
+    start; polars reads it once, at import.
+
+Run:
+    python run_processing.py                 # uses CONFIG below
+    python run_processing.py --workers 4     # or override on the command line
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import multiprocessing as mp
+import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any, Callable
+
+import polars as pl
+
+from pklz_reader import PickleZlibReader
+
+
+# --------------------------------------------------------------------------- #
+# Hyperparameters — everything is set here, before the loop
+# --------------------------------------------------------------------------- #
+@dataclass
+class Config:
+    # --- data ---------------------------------------------------------------
+    root: str = "/data_root"
+    out_dir: str = "/out_dir"
+    processing_module: str = "processing"   # must expose process_id() and SCHEMA
+
+    # --- batching -----------------------------------------------------------
+    batch_size: int = 5000
+
+    # --- parallelism --------------------------------------------------------
+    n_workers: int = 8
+    n_threads: int | None = None        # threads per worker, over elements of a batch
+    polars_threads: int | None = None   # POLARS_MAX_THREADS inside each worker
+    start_method: str = "forkserver"    # "forkserver" | "spawn" — never "fork"
+
+    # --- reader -------------------------------------------------------------
+    io_workers: int = 2                 # per worker; keep small, they multiply
+    decode_workers: int = 2
+    prefetch_batches: int = 2           # decode batch N+1 while you compute batch N
+    max_chunk_bytes: int = 32 * 1024 * 1024
+
+    # --- output -------------------------------------------------------------
+    table_prefix: str = "tbl_1"
+    compression: str = "zstd"
+    overwrite: bool = False             # True = ignore existing files, redo everything
+
+    def resolved(self) -> Config:
+        """Fill in the thread counts that depend on the machine."""
+        n_cpu = os.cpu_count() or 4
+        share = max(1, n_cpu // max(1, self.n_workers))
+        return replace(
+            self,
+            n_threads=self.n_threads if self.n_threads is not None else share,
+            polars_threads=(self.polars_threads if self.polars_threads is not None
+                            else share),
+        )
+
+
+CONFIG = Config(
+    root="/data_root",
+    out_dir="/out_dir",
+    processing_module="processing",
+    batch_size=5000,
+    n_workers=8,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Your code, loaded by name so it is importable in every worker process
+# --------------------------------------------------------------------------- #
+def load_processing(cfg: Config) -> tuple[Callable[..., dict[str, Any]], dict[str, Any]]:
+    mod = importlib.import_module(cfg.processing_module)
+    return mod.process_id, mod.SCHEMA
+
+
+def rows_to_frame(rows: list[dict[str, Any]], schema: dict[str, Any]) -> pl.DataFrame:
+    """Transpose the batch's row dicts into columns and build ONE frame.
+
+    This is the whole point of collecting rows first: one DataFrame per batch
+    instead of one per element plus an N-way concat, which measured ~36% of a
+    batch. Passing `schema` also pins the dtypes, so every parquet part has an
+    identical schema and the parts can be read back as one dataset.
+    """
+    try:
+        return pl.DataFrame({k: [r[k] for r in rows] for k in schema}, schema=schema)
+    except KeyError as exc:
+        raise KeyError(
+            f"process_id() did not return column {exc} required by SCHEMA; "
+            f"it returned {sorted(rows[0])}"
+        ) from None
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic batch numbering + resume
+# --------------------------------------------------------------------------- #
+def shard_plan(reader: PickleZlibReader, batch_size: int) -> list[tuple[Path, int, int]]:
+    """(shard, first batch_idx, n_batches) for each of this worker's shards.
+
+    Reads only the indexes, never a data file. Batches never straddle shards,
+    so a shard's batch count follows from its record count alone — which is
+    what makes `batch_idx` reproducible across runs.
+    """
+    plan, idx = [], 0
+    for shard in reader.shards:
+        index = reader.load_index(shard)
+        n_records = sum(1 for span in index.values() if span[1] > 0)
+        n_batches = -(-n_records // batch_size)   # ceil
+        plan.append((shard, idx, n_batches))
+        idx += n_batches
+    return plan
+
+
+def part_path(worker_dir: Path, cfg: Config, batch_idx: int) -> Path:
+    return worker_dir / f"{cfg.table_prefix}_part_{batch_idx}.parquet"
+
+
+# --------------------------------------------------------------------------- #
+# Worker: its own shards, threads over elements, one frame + one file per batch
+# --------------------------------------------------------------------------- #
+def process_shards(cfg: Config, worker_id: int, shard_names: list[str]) -> dict[str, int]:
+    """One worker process. Builds its own reader — readers own threads and must
+    not cross a process boundary."""
+    stats = {"rows": 0, "batches": 0, "skipped_batches": 0, "skipped_shards": 0}
+    if not shard_names:
+        return stats
+
+    process_id, schema = load_processing(cfg)
+    worker_dir = Path(cfg.out_dir) / f"worker_{worker_id}"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+
+    reader = PickleZlibReader(
+        cfg.root,
+        io_workers=cfg.io_workers,
+        decode_workers=cfg.decode_workers,
+        prefetch_batches=cfg.prefetch_batches,
+        max_chunk_bytes=cfg.max_chunk_bytes,
+    )
+    reader.shards = [Path(cfg.root) / name for name in shard_names]
+
+    # Plan first, from indexes only, so completed shards are skipped before
+    # their data file is ever opened.
+    plan = shard_plan(reader, cfg.batch_size)
+    first_idx = {shard: start for shard, start, _ in plan}
+    todo = []
+    for shard, start, n_batches in plan:
+        if cfg.overwrite or not all(
+            part_path(worker_dir, cfg, start + j).exists() for j in range(n_batches)
+        ):
+            todo.append(shard)
+        else:
+            stats["skipped_shards"] += 1
+            stats["skipped_batches"] += n_batches
+    reader.shards = todo
+    if not todo:
+        return stats
+
+    n_threads = cfg.n_threads or 1
+    current, j = None, 0
+    with ThreadPoolExecutor(n_threads) as pool, reader:
+        for shard, batch in reader.iter_shard_batches(cfg.batch_size):
+            if shard != current:
+                current, j = shard, 0
+            batch_idx = first_idx[shard] + j
+            j += 1
+
+            final = part_path(worker_dir, cfg, batch_idx)
+            if final.exists() and not cfg.overwrite:   # partially finished shard
+                stats["skipped_batches"] += 1
+                continue
+
+            if n_threads > 1:
+                rows = list(pool.map(lambda kv: process_id(kv[0], kv[1]), batch))
+            else:
+                rows = [process_id(app_id, data) for app_id, data in batch]
+
+            df = rows_to_frame(rows, schema)
+            tmp = worker_dir / f".{final.name}.tmp"
+            df.write_parquet(tmp, compression=cfg.compression)
+            tmp.replace(final)          # atomic: the part appears only when complete
+
+            stats["rows"] += df.height
+            stats["batches"] += 1
+
+    return stats
+
+
+# --------------------------------------------------------------------------- #
+# Parent: assign shards, fan out, wait
+# --------------------------------------------------------------------------- #
+def run(cfg: Config) -> dict[str, int]:
+    cfg = cfg.resolved()
+    Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
+
+    shards = [s.name for s in PickleZlibReader(cfg.root).shards]
+    n_workers = max(1, min(cfg.n_workers, len(shards)))
+    assignment = [shards[w::n_workers] for w in range(n_workers)]
+
+    print(f"{len(shards)} shards -> {n_workers} workers x {cfg.n_threads} threads "
+          f"({cfg.start_method}, POLARS_MAX_THREADS={cfg.polars_threads}, "
+          f"batch_size={cfg.batch_size})")
+
+    if n_workers == 1:              # single worker stays in-process: far easier to debug
+        results = [process_shards(cfg, 0, assignment[0])]
+    else:
+        if cfg.start_method == "fork":
+            raise ValueError(
+                "fork deadlocks with polars' Rust thread pool — "
+                "use 'forkserver' or 'spawn'"
+            )
+        # Must be set before the child imports polars; forkserver and spawn
+        # both start a fresh interpreter that inherits this environment.
+        os.environ["POLARS_MAX_THREADS"] = str(cfg.polars_threads)
+
+        ctx = mp.get_context(cfg.start_method)
+        with ProcessPoolExecutor(n_workers, mp_context=ctx) as ex:
+            futures = [ex.submit(process_shards, cfg, w, assignment[w])
+                       for w in range(n_workers)]
+            results = [f.result() for f in futures]   # worker errors re-raise here
+
+    total = {k: sum(r[k] for r in results) for k in results[0]}
+    return total
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Resumable processing over pkl.z shards")
+    ap.add_argument("--root", default=CONFIG.root)
+    ap.add_argument("--out-dir", default=CONFIG.out_dir)
+    ap.add_argument("--processing-module", default=CONFIG.processing_module)
+    ap.add_argument("--batch-size", type=int, default=CONFIG.batch_size)
+    ap.add_argument("--workers", type=int, default=CONFIG.n_workers)
+    ap.add_argument("--threads", type=int, default=CONFIG.n_threads)
+    ap.add_argument("--polars-threads", type=int, default=CONFIG.polars_threads)
+    ap.add_argument("--start-method", default=CONFIG.start_method,
+                    choices=["forkserver", "spawn", "fork"])
+    ap.add_argument("--overwrite", action="store_true")
+    args = ap.parse_args()
+
+    cfg = replace(
+        CONFIG,
+        root=args.root,
+        out_dir=args.out_dir,
+        processing_module=args.processing_module,
+        batch_size=args.batch_size,
+        n_workers=args.workers,
+        n_threads=args.threads,
+        polars_threads=args.polars_threads,
+        start_method=args.start_method,
+        overwrite=args.overwrite,
+    )
+
+    from time import perf_counter
+
+    t0 = perf_counter()
+    stats = run(cfg)
+    dt = perf_counter() - t0
+    rate = f"  ({stats['rows'] / dt:,.0f} rec/s)" if stats["rows"] else ""
+    print(f"{stats['rows']:,} rows in {stats['batches']} parts, "
+          f"skipped {stats['skipped_batches']} parts "
+          f"({stats['skipped_shards']} whole shards), in {dt:.1f}s{rate}")
+
+
+if __name__ == "__main__":
+    main()

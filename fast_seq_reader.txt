@@ -1,0 +1,716 @@
+"""
+pklz_store.py — fast sequential batch reader for `pickle + zlib` blob shards.
+
+Layout it expects (exactly your layout):
+
+    /data_root/
+        subdir_0000/
+            data.pkl.z      # concatenated per-record blobs: zlib(pickle(obj))
+            index.pkl.z     # zlib(pickle(dict[app_id, (start_byte, byte_len)]))
+        subdir_0001/
+            ...
+
+What it does differently from the obvious `seek(start); read(length)` loop:
+
+  * DISK ORDER, NOT DICT ORDER. Records are read in ascending `start_byte`, so
+    the file is walked strictly forwards. (If the index is already in write
+    order, the sort is skipped — one pass, no per-record tuple.)
+  * COALESCED READS. Adjacent (or near-adjacent) records are pulled with ONE
+    `pread` of up to `max_chunk_bytes`, not one syscall per record, which lets
+    the kernel/device do full-size sequential I/O instead of 4 KB dribbles.
+  * PIPELINED PREFETCH. Chunks N+1..N+k are read by an I/O thread pool while
+    chunk N is being decoded, so I/O wait overlaps CPU work.
+  * PARALLEL DECODE, BUT ONLY WHEN IT PAYS. `zlib.decompress` releases the GIL;
+    `pickle.loads` does not. The store times both on your first chunk of real
+    data and only fans out across threads when decompression actually
+    dominates — see `_probe`.
+  * BOUNDED MEMORY. Only one batch of decoded objects is alive at a time, not a
+    whole chunk's worth, and records reach the decoder as `memoryview` slices
+    of the read buffer (no per-record `bytes` copy).
+
+Measured here (Apple SSD, warm page cache, 12k records per run, vs. the naive
+loop producing the same batches):
+
+    payload                            naive     this class
+    nested dicts, 0.8 KB/rec        114k rec/s   106k rec/s  (0.93x)
+    array/binary, 14 KB/rec          31k rec/s    94k rec/s  (3.0x)
+
+Read that honestly: when the payload is small nested Python objects and the
+file is already in RAM, `pickle.loads` is ~85% of the cost, nothing can be
+parallelised, and the planning pass makes this ~7% slower than the naive loop.
+The wins come from binary/array payloads (3x, from threaded decompression) and
+from real I/O — data larger than page cache, network/EBS volumes, spinning
+disks — which is the case a full sweep over a huge dataset actually hits.
+
+Typical usage — one pass over everything:
+
+    store = PickleZlibStore("/data_root")
+    for batch in store.iter_batches(batch_size=1024):
+        # batch is list[tuple[app_id, obj]], in on-disk order
+        train_step(batch)
+
+The context-manager form is equivalent and purely optional — it just calls
+`close()` for you at the end:
+
+    with PickleZlibStore("/data_root") as store:
+        ...
+
+Nothing is opened in the constructor and every read opens and closes its own
+descriptor, so a long-lived store holds no file handles between calls. The only
+thing `close()` does is shut down the worker threads, and an abandoned store
+does that itself when garbage-collected. Keep one store per dataset alive for
+as long as you like — as an attribute of a Dataset/loader, a module global, or
+whatever suits — and reuse it across epochs.
+
+Random access is available too (`get` / `get_many`), but this class is tuned
+for the full sequential sweep.
+
+Run `python pklz_store.py` to reproduce the table above and the self-checks.
+
+Stdlib only. Python >= 3.12.
+"""
+
+from __future__ import annotations
+
+import os
+import pickle
+import weakref
+import zlib
+from collections import deque
+from collections.abc import Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from time import perf_counter
+from typing import Any
+
+__all__ = ["PickleZlibStore"]
+
+MiB = 1024 * 1024
+
+# Never hand a decode thread less than this much compressed data — below it, the
+# Future dispatch costs more than the work.
+_DECODE_TASK_MIN_BYTES = 256 * 1024
+
+# --- auto-tuning of the decode fan-out (see PickleZlibStore._probe) --------- #
+# Threading a decode only pays when `zlib.decompress` — the one half that drops
+# the GIL — is both a large share of the work AND long enough per call that the
+# GIL handoff is amortised. Measured on this machine:
+#   nested dicts, 0.7 KB/rec : zlib 68% but only 2.9us/rec -> 4 threads = 0.64x
+#   nested dicts,  16 KB/rec : zlib 16%                    -> 4 threads = 1.00x
+#   numpy f32,    2.5 KB/rec : zlib high, ~20us/rec        -> 2 threads = 1.67x
+#   numpy f32,     53 KB/rec : zlib high, ~200us/rec       -> 8 threads = 3.03x
+_PROBE_RECORDS = 32
+_FANOUT_MIN_ZLIB_SHARE = 0.35
+_FANOUT_MIN_ZLIB_SECONDS = 8e-6
+
+
+# --------------------------------------------------------------------------- #
+# Record codec
+# --------------------------------------------------------------------------- #
+def _decode(blob: memoryview | bytes) -> Any:
+    """zlib(pickle(obj)) -> obj.
+
+    Cheap auto-detection: a raw pickle stream of protocol >= 2 starts with the
+    PROTO opcode 0x80, which is not a valid zlib header, so shards that were
+    written without compression still load.
+    """
+    if blob[:1] == b"\x80":
+        return pickle.loads(blob)
+    return pickle.loads(zlib.decompress(blob))
+
+
+def _decode_group(blobs: list[memoryview]) -> list[Any]:
+    """Decode a run of records as one unit of work.
+
+    Records are decoded in groups, not one future per record: dispatching a
+    Future costs more than a small record's decode. The codec check happens
+    once per group and the loop calls the C functions directly — at a few
+    microseconds per record, an extra Python frame is measurable.
+    """
+    loads = pickle.loads
+    if blobs and blobs[0][:1] == b"\x80":  # stored uncompressed
+        return [loads(b) for b in blobs]
+    decompress = zlib.decompress
+    return [loads(decompress(b)) for b in blobs]
+
+
+def _shutdown_pools(*pools: ThreadPoolExecutor | None) -> None:
+    """Finalizer body. Module-level and pool-only so it never resurrects a store."""
+    for pool in pools:
+        if pool is not None:
+            pool.shutdown(wait=False)
+
+
+def _load_pklz(path: Path) -> Any:
+    with open(path, "rb") as fh:
+        return _decode(fh.read())
+
+
+def _pread_exact(fd: int, length: int, offset: int) -> bytes:
+    """`os.pread` that keeps pulling until `length` bytes are in hand.
+
+    Thread-safe (no shared file position), unlike seek()+read().
+    """
+    buf = os.pread(fd, length, offset)
+    if len(buf) == length:
+        return buf
+    parts = [buf]
+    got = len(buf)
+    while got < length:
+        more = os.pread(fd, length - got, offset + got)
+        if not more:
+            raise EOFError(f"short read at offset {offset}: {got}/{length} bytes")
+        parts.append(more)
+        got += len(more)
+    return b"".join(parts)
+
+
+@dataclass(slots=True)
+class _Chunk:
+    """One coalesced read: a byte span plus the records living inside it.
+
+    `keys` and `spans` are parallel lists so the read loop can `zip()` them at
+    C speed instead of unpacking a list of triples in Python.
+    """
+
+    start: int
+    length: int
+    keys: list[str]
+    spans: list[tuple[int, int]]  # (offset relative to chunk.start, byte_len)
+
+
+# --------------------------------------------------------------------------- #
+# Store
+# --------------------------------------------------------------------------- #
+class PickleZlibStore:
+    """Sequential/batched reader over a tree of (data.pkl.z, index.pkl.z) shards.
+
+    Parameters
+    ----------
+    root
+        Directory containing the shard subdirectories. If `root` itself holds
+        `data.pkl.z` + `index.pkl.z` it is treated as a single shard.
+    data_name, index_name
+        Filenames inside each shard directory.
+    recursive
+        Walk the whole tree instead of only `root`'s direct children. Use when
+        shards are nested more than one level deep.
+    batch_size
+        Default batch size for `iter_batches`.
+    max_chunk_bytes
+        Upper bound on a single coalesced read (default 32 MB). Bigger = fewer
+        syscalls but more peak RAM (roughly `max_chunk_bytes * (prefetch + 1)`
+        of compressed data in flight, plus the decoded batch).
+    max_gap_bytes
+        Records separated by at most this many unused bytes are still merged
+        into one read (default 1 MB). Reading a small hole is cheaper than
+        paying for a second syscall + seek. Set to 0 to only merge records that
+        are exactly adjacent.
+    io_workers
+        Threads issuing `pread`. 2-4 is right for NVMe; 1 is right for a
+        spinning disk or a network filesystem where seeks are expensive.
+    decode_workers
+        Size of the decode thread pool. Default `min(4, cpu_count)`; 0 forces
+        every record to be decoded on the calling thread.
+    fan_out_decode
+        Whether to actually use that pool. `None` (default) measures it on the
+        first chunk of your real data and decides — see `_probe`. Threading
+        decode is not a free win: `zlib.decompress` releases the GIL but
+        `pickle.loads` does not, so payloads dominated by Python object
+        construction (nested dicts/lists) run up to 35% SLOWER on 4 threads,
+        while payloads dominated by decompression (numpy arrays, big blobs)
+        run 1.5-3x faster. Pass True/False to skip the probe and force it.
+    prefetch_chunks
+        How many chunk reads may be in flight ahead of the consumer.
+    drop_page_cache
+        Linux only: `posix_fadvise(DONTNEED)` each shard once it is consumed.
+        Worth enabling for a full sweep over a dataset far bigger than RAM, so
+        the pass does not evict everything else on the box.
+    """
+
+    def __init__(
+        self,
+        root: str | os.PathLike[str],
+        *,
+        data_name: str = "data.pkl.z",
+        index_name: str = "index.pkl.z",
+        recursive: bool = False,
+        batch_size: int = 1024,
+        max_chunk_bytes: int = 32 * MiB,
+        max_gap_bytes: int = 1 * MiB,
+        io_workers: int = 3,
+        decode_workers: int | None = None,
+        fan_out_decode: bool | None = None,
+        prefetch_chunks: int = 3,
+        drop_page_cache: bool = False,
+    ) -> None:
+        self.root = Path(root)
+        self.data_name = data_name
+        self.index_name = index_name
+        self.batch_size = batch_size
+        self.max_chunk_bytes = max_chunk_bytes
+        self.max_gap_bytes = max_gap_bytes
+        self.prefetch_chunks = max(1, prefetch_chunks)
+        self.drop_page_cache = drop_page_cache
+
+        # Discover before spawning threads, so a bad root doesn't leak pools.
+        self.shards: list[Path] = self._discover(recursive)
+        if not self.shards:
+            raise FileNotFoundError(
+                f"no shard under {self.root} contains both {data_name} and {index_name}"
+            )
+
+        if decode_workers is None:
+            decode_workers = min(4, os.cpu_count() or 4)
+        self._decode_workers = decode_workers
+        # None = decide on the first chunk of real data (see `_probe`).
+        self.fan_out_decode = fan_out_decode
+        self._io_pool = ThreadPoolExecutor(max(1, io_workers), thread_name_prefix="pklz-io")
+        self._decode_pool = (
+            ThreadPoolExecutor(decode_workers, thread_name_prefix="pklz-dec")
+            if decode_workers > 0
+            else None
+        )
+        self._key_map: dict[str, tuple[int, int, int]] | None = None  # id -> (shard_i, start, len)
+        # `with` is optional: if the store is simply dropped, this releases the
+        # pools on GC. It takes the pools, never `self`, or the store would
+        # never become collectable in the first place.
+        self._finalizer = weakref.finalize(
+            self, _shutdown_pools, self._io_pool, self._decode_pool
+        )
+
+    # ----------------------------------------------------------------- setup
+    def _discover(self, recursive: bool) -> list[Path]:
+        def is_shard(d: Path) -> bool:
+            return (d / self.data_name).is_file() and (d / self.index_name).is_file()
+
+        if is_shard(self.root):
+            return [self.root]
+        it = self.root.rglob("*") if recursive else self.root.iterdir()
+        return sorted(d for d in it if d.is_dir() and is_shard(d))
+
+    def load_index(self, shard: Path) -> dict[str, tuple[int, int]]:
+        """Decompress+unpickle one shard's index. Not cached — indexes are big."""
+        return _load_pklz(shard / self.index_name)
+
+    def _plan(self, index: dict[str, Any]) -> list[_Chunk]:
+        """Order by offset and coalesce neighbours into chunked reads.
+
+        Fast path first: an index written alongside its data file is already in
+        ascending-offset order (dicts preserve insertion order), so a single
+        pass usually suffices and the sort — plus one tuple per record — is
+        skipped entirely.
+        """
+        chunks = self._coalesce(index.items(), bail_if_unordered=True)
+        if chunks is not None:
+            return chunks
+        ordered = sorted((v[0], v[1], k) for k, v in index.items())
+        return self._coalesce(
+            ((k, (start, ln)) for start, ln, k in ordered), bail_if_unordered=False
+        )  # type: ignore[return-value]
+
+    def _coalesce(
+        self, items: Any, *, bail_if_unordered: bool
+    ) -> list[_Chunk] | None:
+        """Merge (key, (start, len)) pairs into chunks. None => not in offset order."""
+        max_gap, max_chunk = self.max_gap_bytes, self.max_chunk_bytes
+        chunks: list[_Chunk] = []
+        cur: _Chunk | None = None
+        prev_start = -1
+        for key, (start, length) in items:
+            if bail_if_unordered:
+                if start < prev_start:
+                    return None
+                prev_start = start
+            if length <= 0:
+                continue
+            if cur is not None:
+                # max() so a record nested inside the current span can't shrink it
+                span = max(cur.length, start + length - cur.start)
+                if start - (cur.start + cur.length) <= max_gap and span <= max_chunk:
+                    cur.keys.append(key)
+                    cur.spans.append((start - cur.start, length))
+                    cur.length = span
+                    continue
+                chunks.append(cur)
+            cur = _Chunk(start=start, length=length, keys=[key], spans=[(0, length)])
+        if cur is not None:
+            chunks.append(cur)
+        return chunks
+
+    def _probe(self, view: memoryview, spans: list[tuple[int, int]]) -> bool:
+        """Time zlib vs pickle on a sample of real records; decide on fan-out.
+
+        Costs a few milliseconds, once per store. See the constants above for
+        why both the share and the absolute per-call cost of `zlib.decompress`
+        have to clear a bar before threads are worth using.
+        """
+        off0 = spans[0][0]
+        if view[off0 : off0 + 1] == b"\x80":  # uncompressed: nothing releases the GIL
+            return False
+        step = max(1, len(spans) // _PROBE_RECORDS)
+        sample = [view[off : off + ln] for off, ln in spans[::step][:_PROBE_RECORDS]]
+
+        t0 = perf_counter()
+        raw = [zlib.decompress(b) for b in sample]
+        t_zlib = perf_counter() - t0
+        t0 = perf_counter()
+        for b in raw:
+            pickle.loads(b)
+        t_pickle = perf_counter() - t0
+
+        share = t_zlib / (t_zlib + t_pickle) if (t_zlib + t_pickle) else 0.0
+        return (
+            share >= _FANOUT_MIN_ZLIB_SHARE
+            and t_zlib / len(sample) >= _FANOUT_MIN_ZLIB_SECONDS
+        )
+
+    def _decode_span(self, view: memoryview, spans: list[tuple[int, int]]) -> list[Any]:
+        """Decode one batch worth of records, in order, fanning out when it pays off.
+
+        Only a batch is decoded at a time (never a whole chunk): decoded objects
+        are far larger than the compressed bytes they came from, so this is what
+        keeps peak RSS at ~one batch instead of ~one chunk's worth of inflated
+        Python objects.
+        """
+        pool = self._decode_pool
+        n_tasks = 1
+        # Byte span of this slice — O(1) stand-in for the sum of record lengths.
+        nbytes = spans[-1][0] + spans[-1][1] - spans[0][0]
+        if pool is not None and len(spans) > 1 and nbytes >= 2 * _DECODE_TASK_MIN_BYTES:
+            if self.fan_out_decode is None:
+                self.fan_out_decode = self._probe(view, spans)
+            if self.fan_out_decode:
+                n_tasks = min(self._decode_workers, nbytes // _DECODE_TASK_MIN_BYTES, len(spans))
+
+        if n_tasks < 2:
+            loads = pickle.loads
+            off0 = spans[0][0]
+            if view[off0 : off0 + 1] == b"\x80":
+                return [loads(view[off : off + ln]) for off, ln in spans]
+            decompress = zlib.decompress
+            return [loads(decompress(view[off : off + ln])) for off, ln in spans]
+
+        step = -(-len(spans) // n_tasks)  # ceil
+        groups = [
+            [view[off : off + ln] for off, ln in spans[i : i + step]]
+            for i in range(0, len(spans), step)
+        ]
+        out: list[Any] = []
+        for part in pool.map(_decode_group, groups):  # map preserves submission order
+            out.extend(part)
+        return out
+
+    # ------------------------------------------------------------- iteration
+    def iter_batches(
+        self,
+        batch_size: int | None = None,
+        *,
+        with_keys: bool = True,
+        start_shard: int = 0,
+    ) -> Iterator[list[Any]]:
+        """Yield batches of decoded records across every shard, in on-disk order.
+
+        Each batch is `list[tuple[app_id, obj]]` (or `list[obj]` when
+        `with_keys=False`). The final batch of the last shard may be short;
+        batches do not straddle shard boundaries.
+
+        `start_shard` lets a long pass resume where it left off.
+        """
+        for _, batch in self.iter_shard_batches(
+            batch_size, with_keys=with_keys, start_shard=start_shard
+        ):
+            yield batch
+
+    def iter_shard_batches(
+        self,
+        batch_size: int | None = None,
+        *,
+        with_keys: bool = True,
+        start_shard: int = 0,
+    ) -> Iterator[tuple[Path, list[Any]]]:
+        """Same as `iter_batches`, but each yield is `(shard_path, batch)`.
+
+        Useful for checkpointing progress across a multi-hour sweep.
+        """
+        if self.closed:
+            raise RuntimeError("this PickleZlibStore was closed; construct a new one")
+        n = batch_size or self.batch_size
+        for shard in self.shards[start_shard:]:
+            for batch in self._iter_one_shard(shard, n, with_keys):
+                yield shard, batch
+
+    def iter_records(self, *, with_keys: bool = True) -> Iterator[Any]:
+        """Flat record-at-a-time view (still batched + prefetched underneath)."""
+        for batch in self.iter_batches(with_keys=with_keys):
+            yield from batch
+
+    def _iter_one_shard(
+        self, shard: Path, batch_size: int, with_keys: bool
+    ) -> Iterator[list[Any]]:
+        chunks = self._plan(self.load_index(shard))
+        if not chunks:
+            return
+
+        fd = os.open(shard / self.data_name, os.O_RDONLY)
+        inflight: deque[tuple[_Chunk, Future[bytes]]] = deque()
+        try:
+            if hasattr(os, "posix_fadvise"):
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+
+            pending = iter(chunks)
+
+            def pump() -> None:
+                while len(inflight) < self.prefetch_chunks:
+                    chunk = next(pending, None)
+                    if chunk is None:
+                        return
+                    inflight.append(
+                        (chunk, self._io_pool.submit(_pread_exact, fd, chunk.length, chunk.start))
+                    )
+
+            pump()
+            carry: list[Any] = []  # tail of the previous chunk, < batch_size items
+            while inflight:
+                chunk, fut = inflight.popleft()
+                buf = fut.result()
+                pump()  # refill the read window as soon as a slot frees up
+
+                view = memoryview(buf)
+                spans, keys, pos = chunk.spans, chunk.keys, 0
+                while pos < len(spans):
+                    take = batch_size - len(carry)  # carry is always < batch_size here
+                    decoded = self._decode_span(view, spans[pos : pos + take])
+                    if with_keys:
+                        items = list(zip(keys[pos : pos + take], decoded, strict=True))
+                    else:
+                        items = decoded
+                    pos += take
+
+                    if carry:
+                        carry.extend(items)
+                    else:
+                        carry = items  # steal the list instead of copying into one
+                    if len(carry) >= batch_size:
+                        yield carry
+                        carry = []
+                del view, buf
+
+            if carry:
+                yield carry
+
+            if self.drop_page_cache and hasattr(os, "POSIX_FADV_DONTNEED"):
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            # The consumer may abandon this generator mid-shard. Reads still
+            # queued are cancelled; one already running has to be waited for,
+            # because closing the fd under it would let the number be reused.
+            for _, fut in inflight:
+                fut.cancel()
+            for _, fut in inflight:
+                if not fut.cancelled():
+                    try:
+                        fut.result()
+                    except Exception:
+                        pass
+            os.close(fd)
+
+    # --------------------------------------------------------- random access
+    def build_key_map(self) -> dict[str, tuple[int, int, int]]:
+        """Load every index into one `app_id -> (shard_idx, start, len)` map.
+
+        Only needed for `get`/`get_many`; a plain sweep never calls it. Costs
+        roughly the combined size of all index dicts in RAM.
+        """
+        if self._key_map is None:
+            key_map: dict[str, tuple[int, int, int]] = {}
+            for i, shard in enumerate(self.shards):
+                for key, (start, length) in self.load_index(shard).items():
+                    key_map[str(key)] = (i, int(start), int(length))
+            self._key_map = key_map
+        return self._key_map
+
+    def get(self, app_id: str) -> Any:
+        """Fetch a single record by id."""
+        shard_i, start, length = self.build_key_map()[app_id]
+        fd = os.open(self.shards[shard_i] / self.data_name, os.O_RDONLY)
+        try:
+            return _decode(_pread_exact(fd, length, start))
+        finally:
+            os.close(fd)
+
+    def get_many(self, app_ids: Sequence[str], *, with_keys: bool = True) -> list[Any]:
+        """Fetch many records by id, reading each shard in coalesced disk order.
+
+        Returns results in the order `app_ids` was given.
+        """
+        if self.closed:
+            raise RuntimeError("this PickleZlibStore was closed; construct a new one")
+        key_map = self.build_key_map()
+        by_shard: dict[int, dict[str, tuple[int, int]]] = {}
+        for app_id in app_ids:
+            shard_i, start, length = key_map[app_id]
+            by_shard.setdefault(shard_i, {})[app_id] = (start, length)
+
+        out: dict[str, Any] = {}
+        for shard_i, sub in by_shard.items():
+            for batch in self._iter_one_shard_subset(self.shards[shard_i], sub):
+                out.update(batch)
+        if with_keys:
+            return [(app_id, out[app_id]) for app_id in app_ids]
+        return [out[app_id] for app_id in app_ids]
+
+    def _iter_one_shard_subset(
+        self, shard: Path, index: dict[str, tuple[int, int]]
+    ) -> Iterator[dict[str, Any]]:
+        fd = os.open(shard / self.data_name, os.O_RDONLY)
+        try:
+            for chunk in self._plan(index):
+                view = memoryview(_pread_exact(fd, chunk.length, chunk.start))
+                decoded = self._decode_span(view, chunk.spans)
+                yield dict(zip(chunk.keys, decoded, strict=True))
+                del view, decoded
+        finally:
+            os.close(fd)
+
+    # ------------------------------------------------------------ misc/dunder
+    def keys(self) -> Iterator[str]:
+        """All app ids, shard by shard (index order within a shard)."""
+        for shard in self.shards:
+            yield from map(str, self.load_index(shard))
+
+    def __len__(self) -> int:
+        return sum(len(self.load_index(s)) for s in self.shards)
+
+    @property
+    def closed(self) -> bool:
+        return not self._finalizer.alive
+
+    def close(self) -> None:
+        """Shut the thread pools down. Idempotent; optional (see `_finalizer`).
+
+        Only worth calling explicitly when you want the threads gone at a known
+        point — the store holds no open file descriptors between calls.
+        """
+        if self._finalizer.detach() is not None:
+            self._io_pool.shutdown(wait=True)
+            if self._decode_pool is not None:
+                self._decode_pool.shutdown(wait=True)
+
+    def __enter__(self) -> PickleZlibStore:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        return f"PickleZlibStore(root={str(self.root)!r}, shards={len(self.shards)})"
+
+
+# --------------------------------------------------------------------------- #
+# Smoke test + benchmark vs. the naive per-record seek/read loop
+# --------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    import array
+    import random
+    import shutil
+    import tempfile
+
+    N_SHARDS, PER_SHARD = 4, 3_000
+
+    def make_record(rng: random.Random, i: int, kind: str) -> dict[str, Any]:
+        if kind == "nested":  # pure-Python objects: pickle.loads dominates
+            return {
+                "features": [rng.random() for _ in range(64)],
+                "hist": [
+                    {"amt": rng.randint(1, 9999), "cat": rng.randint(0, 20)} for _ in range(40)
+                ],
+            }
+        # binary payload: zlib.decompress dominates
+        return {"x": array.array("f", (rng.random() for _ in range(4000))), "n": i}
+
+    def write_shards(tmp: Path, kind: str) -> int:
+        rng = random.Random(0)
+        total = 0
+        for s in range(N_SHARDS):
+            d = tmp / f"subdir_{s:04d}"
+            d.mkdir()
+            index: dict[str, tuple[int, int]] = {}
+            pos = 0
+            with open(d / "data.pkl.z", "wb") as fh:
+                for i in range(PER_SHARD):
+                    rec = make_record(rng, i, kind)
+                    blob = zlib.compress(pickle.dumps(rec, protocol=pickle.HIGHEST_PROTOCOL), 6)
+                    fh.write(blob)
+                    index[f"app_{s}_{i}"] = (pos, len(blob))
+                    pos += len(blob)
+            total += pos
+            with open(d / "index.pkl.z", "wb") as fh:
+                fh.write(zlib.compress(pickle.dumps(index, protocol=pickle.HIGHEST_PROTOCOL), 6))
+        return total
+
+    def naive(tmp: Path, batch_size: int = 1024) -> int:
+        """Baseline: index order, one seek+read+decode per record, same output."""
+        n = 0
+        for d in sorted(p for p in tmp.iterdir() if p.is_dir()):
+            idx = _load_pklz(d / "index.pkl.z")
+            batch: list[Any] = []
+            with open(d / "data.pkl.z", "rb") as fh:
+                for key, (start, length) in idx.items():
+                    fh.seek(start)
+                    batch.append((key, _decode(fh.read(length))))
+                    if len(batch) >= batch_size:
+                        n += len(batch)
+                        batch = []
+            n += len(batch)
+        return n
+
+    def best_of(fn: Any, runs: int = 3) -> tuple[float, int]:
+        best, n = float("inf"), 0
+        for _ in range(runs):
+            t0 = perf_counter()
+            n = fn()
+            best = min(best, perf_counter() - t0)
+        return best, n
+
+    for kind in ("nested", "binary"):
+        tmp = Path(tempfile.mkdtemp(prefix="pklz_"))
+        try:
+            total = write_shards(tmp, kind)
+            n_rec = N_SHARDS * PER_SHARD
+            print(
+                f"\n=== {kind} payload: {N_SHARDS} shards x {PER_SHARD} recs, "
+                f"{total / MiB:.1f} MiB compressed ({total / n_rec / 1024:.1f} KiB/rec) ==="
+            )
+            t_naive, n = best_of(lambda: naive(tmp))
+            assert n == n_rec
+            print(f"  naive seek/read loop  {t_naive:6.3f}s  {n_rec / t_naive:>9,.0f} rec/s")
+
+            for label, kwargs in (
+                ("inline decode      ", {"decode_workers": 0}),
+                ("forced 4 threads   ", {"decode_workers": 4, "fan_out_decode": True}),
+                ("auto (the default) ", {}),
+            ):
+                with PickleZlibStore(tmp, **kwargs) as store:
+                    t, n = best_of(lambda: sum(len(b) for b in store.iter_batches(1024)))
+                    chose = store.fan_out_decode
+                assert n == n_rec, (n, n_rec)
+                print(
+                    f"  {label}  {t:6.3f}s  {n / t:>9,.0f} rec/s  "
+                    f"{t_naive / t:>4.2f}x" + ("   <- probe: threads" if chose else "")
+                )
+
+            with PickleZlibStore(tmp) as store:  # correctness
+                assert len(store) == n_rec
+                assert len(store.shards) == N_SHARDS
+                key, obj = next(iter(store.iter_batches(8)))[0]
+                assert store.get(key) == obj, "batched decode != direct decode"
+                sample = [f"app_0_{i}" for i in (7, 3, 2999, 0, 1500)]
+                assert [k for k, _ in store.get_many(sample)] == sample
+                assert store.get_many(sample, with_keys=False)[0] == store.get("app_0_7")
+                sizes = [len(b) for b in store.iter_batches(700)]
+                assert sum(sizes) == n_rec and sizes[0] == 700
+        finally:
+            shutil.rmtree(tmp)
+    print("\nOK — all assertions passed")

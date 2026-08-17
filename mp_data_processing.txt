@@ -1,0 +1,49 @@
+def process_shards(root, out_dir, shard_names, batch_size=5000, n_threads=2):
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    reader = PickleZlibReader(root, io_workers=2, decode_workers=2, prefetch_batches=2)
+    reader.shards = [Path(root) / name for name in shard_names]      # (1) disjoint shards
+
+    writer = current = tmp = None
+
+    def finish():                       # publish the finished shard atomically
+        nonlocal writer, tmp
+        if writer is not None:
+            writer.close()
+            tmp.replace(out / f"{current.name}.parquet")
+        writer, tmp = None, None
+
+    try:
+        with ThreadPoolExecutor(n_threads) as pool, reader:
+            for shard, batch in reader.iter_shard_batches(batch_size):
+                if shard != current:                    # shard boundary
+                    finish()
+                    current = shard
+                    tmp = out / f".{shard.name}.parquet.tmp"
+
+                records = [rec for _, rec in batch]
+                rows = list(pool.map(legacy_row, records))            # (2) threads
+
+                table = _rows_to_frame(rows).to_arrow()               # (4) one frame
+                if writer is None:
+                    writer = pq.ParquetWriter(tmp, table.schema, compression="zstd")
+                writer.write_table(table)               # one row group per batch
+            finish()
+    except BaseException:
+        if writer is not None: writer.close()
+        if tmp is not None: tmp.unlink(missing_ok=True)
+        raise
+
+
+all_shards = PickleZlibReader(root).shards
+todo = [s for s in all_shards if not (out / f"{s.name}.parquet").exists()]
+if not todo:
+    print("nothing to do"); return
+
+os.environ["POLARS_MAX_THREADS"] = str(polars_threads)   # before the child imports polars
+ctx = mp.get_context("forkserver")                        # never fork: deadlocks with polars
+
+names = [s.name for s in todo]
+with ProcessPoolExecutor(n_workers, mp_context=ctx) as ex:
+    futures = [ex.submit(process_shards, root, out_dir, names[w::n_workers],
+                         batch_size, n_threads) for w in range(n_workers)]
+    results = [f.result() for f in futures]               # worker errors re-raise here

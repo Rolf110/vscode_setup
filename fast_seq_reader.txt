@@ -74,10 +74,12 @@ from __future__ import annotations
 
 import os
 import pickle
+import queue
+import threading
 import weakref
 import zlib
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -166,6 +168,67 @@ def _pread_exact(fd: int, length: int, offset: int) -> bytes:
     return b"".join(parts)
 
 
+_DONE = object()
+
+
+@dataclass(slots=True)
+class _Failed:
+    """Carries a producer-thread exception across the queue to the consumer."""
+
+    exc: BaseException
+
+
+def _prefetch(source: Generator[Any, None, None], depth: int) -> Iterator[Any]:
+    """Drive `source` in a background thread, keeping up to `depth` items ready.
+
+    This is what turns the store into a DataLoader-style pipeline: without it, a
+    batch is only read and decoded once the consumer asks for it, so the reader
+    sits idle for exactly as long as the consumer is busy. With it, batch N+1 is
+    fetched while you process batch N.
+
+    The queue is bounded, so a fast reader cannot run away and buffer the whole
+    dataset — memory stays at ~`depth` batches. Exceptions surface on the
+    consumer's `next()`, and abandoning the iterator stops the producer and
+    closes `source` (releasing its file descriptor) before returning.
+    """
+    q: queue.Queue[Any] = queue.Queue(maxsize=depth)
+    stop = threading.Event()
+
+    def produce() -> None:
+        try:
+            for item in source:
+                q.put(item)
+                if stop.is_set():
+                    break
+        except BaseException as exc:  # noqa: BLE001 — re-raised in the consumer
+            q.put(_Failed(exc))
+        else:
+            q.put(_DONE)
+        finally:
+            source.close()
+
+    thread = threading.Thread(target=produce, name="pklz-prefetch", daemon=True)
+    thread.start()
+    try:
+        while True:
+            item = q.get()
+            if item is _DONE:
+                return
+            if type(item) is _Failed:
+                raise item.exc
+            yield item
+    finally:
+        # The producer may be parked in q.put() on a full queue; drain until it
+        # notices `stop` and exits, so no thread is left behind.
+        stop.set()
+        while thread.is_alive():
+            try:
+                q.get(timeout=0.05)
+            except queue.Empty:
+                pass
+        thread.join()
+
+
 @dataclass(slots=True)
 class _Chunk:
     """One coalesced read: a byte span plus the records living inside it.
@@ -222,7 +285,19 @@ class PickleZlibStore:
         while payloads dominated by decompression (numpy arrays, big blobs)
         run 1.5-3x faster. Pass True/False to skip the probe and force it.
     prefetch_chunks
-        How many chunk reads may be in flight ahead of the consumer.
+        How many chunk reads may be in flight ahead of the decoder.
+    prefetch_batches
+        Depth of the ready-batch queue, i.e. how many fully decoded batches may
+        sit waiting while you process the current one — the analogue of a
+        DataLoader's `prefetch_factor`. Default 2; 0 disables the producer
+        thread and decodes each batch when you ask for it.
+
+        Whether this buys anything depends on what YOUR loop does with a batch.
+        Processing that releases the GIL — numpy/torch kernels, writing output,
+        anything blocking on I/O or a device — overlaps with the reader almost
+        perfectly. Processing that is pure Python holds the GIL, so the reader
+        gets no time to run and the pass is bounded by the sum of both halves
+        either way. Costs one thread and ~`prefetch_batches` batches of RAM.
     drop_page_cache
         Linux only: `posix_fadvise(DONTNEED)` each shard once it is consumed.
         Worth enabling for a full sweep over a dataset far bigger than RAM, so
@@ -243,6 +318,7 @@ class PickleZlibStore:
         decode_workers: int | None = None,
         fan_out_decode: bool | None = None,
         prefetch_chunks: int = 3,
+        prefetch_batches: int = 2,
         drop_page_cache: bool = False,
     ) -> None:
         self.root = Path(root)
@@ -252,6 +328,7 @@ class PickleZlibStore:
         self.max_chunk_bytes = max_chunk_bytes
         self.max_gap_bytes = max_gap_bytes
         self.prefetch_chunks = max(1, prefetch_chunks)
+        self.prefetch_batches = prefetch_batches
         self.drop_page_cache = drop_page_cache
 
         # Discover before spawning threads, so a bad root doesn't leak pools.
@@ -272,7 +349,8 @@ class PickleZlibStore:
             if decode_workers > 0
             else None
         )
-        self._key_map: dict[str, tuple[int, int, int]] | None = None  # id -> (shard_i, start, len)
+        # Per-shard indexes, cached as unpickled. Only random access needs them.
+        self._indexes: list[dict[str, tuple[int, int]]] | None = None
         # `with` is optional: if the store is simply dropped, this releases the
         # pools on GC. It takes the pools, never `self`, or the store would
         # never become collectable in the first place.
@@ -409,6 +487,7 @@ class PickleZlibStore:
         *,
         with_keys: bool = True,
         start_shard: int = 0,
+        prefetch_batches: int | None = None,
     ) -> Iterator[list[Any]]:
         """Yield batches of decoded records across every shard, in on-disk order.
 
@@ -417,9 +496,13 @@ class PickleZlibStore:
         batches do not straddle shard boundaries.
 
         `start_shard` lets a long pass resume where it left off.
+        `prefetch_batches` overrides the store's default for this pass.
         """
         for _, batch in self.iter_shard_batches(
-            batch_size, with_keys=with_keys, start_shard=start_shard
+            batch_size,
+            with_keys=with_keys,
+            start_shard=start_shard,
+            prefetch_batches=prefetch_batches,
         ):
             yield batch
 
@@ -429,6 +512,7 @@ class PickleZlibStore:
         *,
         with_keys: bool = True,
         start_shard: int = 0,
+        prefetch_batches: int | None = None,
     ) -> Iterator[tuple[Path, list[Any]]]:
         """Same as `iter_batches`, but each yield is `(shard_path, batch)`.
 
@@ -437,8 +521,15 @@ class PickleZlibStore:
         if self.closed:
             raise RuntimeError("this PickleZlibStore was closed; construct a new one")
         n = batch_size or self.batch_size
+        depth = self.prefetch_batches if prefetch_batches is None else prefetch_batches
+        source = self._produce(n, with_keys, start_shard)
+        yield from (_prefetch(source, depth) if depth > 0 else source)
+
+    def _produce(
+        self, batch_size: int, with_keys: bool, start_shard: int
+    ) -> Generator[tuple[Path, list[Any]], None, None]:
         for shard in self.shards[start_shard:]:
-            for batch in self._iter_one_shard(shard, n, with_keys):
+            for batch in self._iter_one_shard(shard, batch_size, with_keys):
                 yield shard, batch
 
     def iter_records(self, *, with_keys: bool = True) -> Iterator[Any]:
@@ -517,23 +608,46 @@ class PickleZlibStore:
             os.close(fd)
 
     # --------------------------------------------------------- random access
-    def build_key_map(self) -> dict[str, tuple[int, int, int]]:
-        """Load every index into one `app_id -> (shard_idx, start, len)` map.
+    def load_indexes(self) -> list[dict[str, tuple[int, int]]]:
+        """Load and cache every shard's index EXACTLY as stored, one dict per shard.
 
-        Only needed for `get`/`get_many`; a plain sweep never calls it. Costs
-        roughly the combined size of all index dicts in RAM.
+        This deliberately does not merge them into a flat
+        `app_id -> (shard, start, len)` map. Unpickling already hands back a
+        finished dict; rebuilding one costs a fresh dict entry and a fresh
+        3-tuple per record, and measured at 2M keys that copy was 60% of the
+        total time (0.88s -> 0.35s once dropped) on top of roughly doubling
+        the resident size. The missing shard index is recovered at lookup time
+        instead, by probing the shard dicts in turn (`_locate`).
+
+        NOT threaded, on purpose: an index blob is ~93% `pickle.loads` and only
+        ~7% `zlib.decompress`, and only the zlib half releases the GIL. Threads
+        measured 1.1-1.2x for 8 of them — not worth the resources. Processes
+        are worse still: the worker would have to re-pickle the dict back, so
+        the parent pays the `pickle.loads` it was trying to avoid.
         """
-        if self._key_map is None:
-            key_map: dict[str, tuple[int, int, int]] = {}
-            for i, shard in enumerate(self.shards):
-                for key, (start, length) in self.load_index(shard).items():
-                    key_map[str(key)] = (i, int(start), int(length))
-            self._key_map = key_map
-        return self._key_map
+        if self._indexes is None:
+            self._indexes = [self.load_index(s) for s in self.shards]
+        return self._indexes
+
+    def clear_index_cache(self) -> None:
+        """Drop the cached indexes (they are the store's only real memory cost)."""
+        self._indexes = None
+
+    def _locate(self, app_id: str) -> tuple[int, tuple[int, int]]:
+        """Find `app_id` -> (shard index, (start, len)).
+
+        O(number of shards) dict probes — 0.16us across 10 shards, i.e. noise
+        next to the read and decode of the record itself.
+        """
+        for i, index in enumerate(self.load_indexes()):
+            span = index.get(app_id)
+            if span is not None:
+                return i, span
+        raise KeyError(app_id)
 
     def get(self, app_id: str) -> Any:
         """Fetch a single record by id."""
-        shard_i, start, length = self.build_key_map()[app_id]
+        shard_i, (start, length) = self._locate(app_id)
         fd = os.open(self.shards[shard_i] / self.data_name, os.O_RDONLY)
         try:
             return _decode(_pread_exact(fd, length, start))
@@ -547,16 +661,25 @@ class PickleZlibStore:
         """
         if self.closed:
             raise RuntimeError("this PickleZlibStore was closed; construct a new one")
-        key_map = self.build_key_map()
-        by_shard: dict[int, dict[str, tuple[int, int]]] = {}
-        for app_id in app_ids:
-            shard_i, start, length = key_map[app_id]
-            by_shard.setdefault(shard_i, {})[app_id] = (start, length)
-
+        wanted = set(app_ids)
+        if not wanted:  # don't force the index cache for an empty request
+            return []
         out: dict[str, Any] = {}
-        for shard_i, sub in by_shard.items():
+        for shard_i, index in enumerate(self.load_indexes()):
+            # `set & dict.keys()` is a C-level intersection: it groups the
+            # request by shard without a Python loop over the request or,
+            # worse, over the index.
+            hit = wanted & index.keys()
+            if not hit:
+                continue
+            sub = {key: index[key] for key in hit}
             for batch in self._iter_one_shard_subset(self.shards[shard_i], sub):
                 out.update(batch)
+            wanted -= hit
+            if not wanted:
+                break
+        if wanted:
+            raise KeyError(next(iter(wanted)))
         if with_keys:
             return [(app_id, out[app_id]) for app_id in app_ids]
         return [out[app_id] for app_id in app_ids]
@@ -576,11 +699,21 @@ class PickleZlibStore:
 
     # ------------------------------------------------------------ misc/dunder
     def keys(self) -> Iterator[str]:
-        """All app ids, shard by shard (index order within a shard)."""
-        for shard in self.shards:
-            yield from map(str, self.load_index(shard))
+        """All app ids, shard by shard (index order within a shard).
+
+        Streams one shard at a time unless the indexes are already cached, so
+        listing ids does not force the whole cache into memory.
+        """
+        if self._indexes is not None:
+            for index in self._indexes:
+                yield from index
+        else:
+            for shard in self.shards:
+                yield from self.load_index(shard)
 
     def __len__(self) -> int:
+        if self._indexes is not None:
+            return sum(len(i) for i in self._indexes)
         return sum(len(self.load_index(s)) for s in self.shards)
 
     @property

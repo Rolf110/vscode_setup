@@ -1,0 +1,357 @@
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime
+from typing import Any
+
+import streamlit as st
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_gigachat import GigaChat
+
+
+# Run with:
+#   pip install -U "streamlit>=1.54" "langchain-gigachat>=0.5.1"
+#   export GIGACHAT_CREDENTIALS='...'
+#   streamlit run app.py
+
+st.set_page_config(page_title="GigaChat", page_icon="💬")
+
+
+@tool
+def current_datetime() -> str:
+    """Return the server's current local date/time with timezone."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+TOOLS = [current_datetime]
+TOOL_MAP = {t.name: t for t in TOOLS}
+
+
+for key, default in {
+    "lc_history": [],       # LangChain messages, excluding the system message
+    "ui_history": [],       # Serializable messages used only for rendering/export
+    "regenerate": False,
+    "remote_file_ids": [],
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+def build_llm() -> GigaChat:
+    effort = None if reasoning_effort == "off" else reasoning_effort
+    return GigaChat(
+        credentials=credentials or None,
+        scope=scope,
+        model=model,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=int(max_tokens),
+        repetition_penalty=repetition_penalty,
+        reasoning_effort=effort,
+        verify_ssl_certs=verify_ssl,
+        ca_bundle_file=ca_bundle or None,
+        timeout=float(timeout),
+        max_retries=int(max_retries),
+        retry_backoff_factor=0.5,
+        streaming=False,  # hard requirement: never stream
+    )
+
+
+def attachment_type(mime: str | None) -> str:
+    mime = mime or "application/octet-stream"
+    if mime.startswith("image/"):
+        return "image"
+    if mime.startswith("audio/"):
+        return "audio"
+    return "file"
+
+
+def upload_attachments(llm: GigaChat, uploaded_files: list[Any]) -> list[dict[str, Any]]:
+    result = []
+    for f in uploaded_files:
+        raw = f.getvalue()
+        remote = llm.upload_file((f.name, raw))
+        st.session_state.remote_file_ids.append(remote.id_)
+        kind = attachment_type(getattr(f, "type", None))
+        result.append(
+            {
+                "name": f.name,
+                "mime": getattr(f, "type", None),
+                "size": len(raw),
+                "kind": kind,
+                "file_id": remote.id_,
+                # Keep small media locally only for UI preview.
+                "preview": raw if kind in {"image", "audio"} and len(raw) <= 10_000_000 else None,
+            }
+        )
+    return result
+
+
+def make_user_message(text: str, attachments: list[dict[str, Any]]) -> HumanMessage:
+    if not attachments:
+        return HumanMessage(content=text)
+
+    blocks: list[dict[str, Any]] = []
+    if text:
+        blocks.append({"type": "text", "text": text})
+    blocks.extend({"type": a["kind"], "file_id": a["file_id"]} for a in attachments)
+    return HumanMessage(content_blocks=blocks)
+
+
+def run_llm(llm: GigaChat) -> tuple[Any, list[Any], list[dict[str, Any]]]:
+    """Run one complete non-streaming turn, including optional tool calls."""
+    messages: list[Any] = []
+    if system_prompt.strip():
+        messages.append(SystemMessage(content=system_prompt.strip()))
+    messages.extend(st.session_state.lc_history)
+
+    start = len(messages)
+    runnable = llm.bind_tools(TOOLS, tool_choice="auto") if enable_tools else llm
+    tool_events: list[dict[str, Any]] = []
+
+    for _ in range(6):
+        reply = runnable.invoke(messages)
+        messages.append(reply)
+
+        if not enable_tools or not reply.tool_calls:
+            return reply, messages[start:], tool_events
+
+        # GigaChat doesn't support parallel tool calls, but handle defensively.
+        for call in reply.tool_calls:
+            name = call.get("name", "")
+            args = call.get("args") or {}
+            tool_impl = TOOL_MAP.get(name)
+            try:
+                result = tool_impl.invoke(args) if tool_impl else f"Unknown tool: {name}"
+            except Exception as e:
+                result = f"Tool failed: {type(e).__name__}: {e}"
+
+            tool_events.append({"name": name, "args": args, "result": str(result)})
+            messages.append(
+                ToolMessage(
+                    content=str(result),
+                    tool_call_id=call.get("id") or name or "tool",
+                )
+            )
+
+    raise RuntimeError("Tool-call loop exceeded 6 iterations")
+
+
+def response_text(reply: Any) -> str:
+    if isinstance(reply.content, str):
+        return reply.content
+    if isinstance(reply.content, list):
+        return "\n".join(
+            str(x.get("text", "")) if isinstance(x, dict) else str(x)
+            for x in reply.content
+        )
+    return str(reply.content)
+
+
+def append_assistant(reply: Any, generated: list[Any], tool_events: list[dict[str, Any]]) -> None:
+    st.session_state.lc_history.extend(generated)
+    meta = dict(getattr(reply, "response_metadata", {}) or {})
+    usage = dict(reply.usage_metadata) if getattr(reply, "usage_metadata", None) else None
+    st.session_state.ui_history.append(
+        {
+            "role": "assistant",
+            "text": response_text(reply),
+            "reasoning": reply.additional_kwargs.get("reasoning_content"),
+            "usage": usage,
+            "request_id": getattr(reply, "id", None),
+            "model": meta.get("model_name", model),
+            "finish_reason": meta.get("finish_reason"),
+            "tool_events": tool_events,
+            "attachments": [],
+            "lc_count": len(generated),
+        }
+    )
+
+
+def render_chat() -> None:
+    for msg in st.session_state.ui_history:
+        with st.chat_message(msg["role"]):
+            if msg.get("text"):
+                st.markdown(msg["text"])
+
+            for a in msg.get("attachments", []):
+                if a["kind"] == "image" and a.get("preview") is not None:
+                    st.image(a["preview"], caption=a["name"])
+                elif a["kind"] == "audio" and a.get("preview") is not None:
+                    st.audio(a["preview"], format=a.get("mime") or "audio/wav")
+                else:
+                    st.caption(f"📎 {a['name']} ({a['size'] / 1024:.1f} KB)")
+
+            if msg["role"] == "assistant":
+                if show_reasoning and msg.get("reasoning"):
+                    with st.expander("Reasoning"):
+                        st.markdown(msg["reasoning"])
+
+                if msg.get("tool_events"):
+                    with st.expander("Tool calls"):
+                        for event in msg["tool_events"]:
+                            st.write(event["name"], event["args"])
+                            st.code(event["result"], language=None)
+
+                info = []
+                if msg.get("model"):
+                    info.append(msg["model"])
+                if msg.get("usage"):
+                    u = msg["usage"]
+                    info.append(
+                        f"tokens: {u.get('input_tokens', '?')} in / "
+                        f"{u.get('output_tokens', '?')} out / {u.get('total_tokens', '?')} total"
+                    )
+                if msg.get("finish_reason"):
+                    info.append(f"finish: {msg['finish_reason']}")
+                if msg.get("request_id"):
+                    info.append(f"request: {msg['request_id']}")
+                if info:
+                    st.caption(" · ".join(info))
+
+
+def export_json() -> str:
+    clean = []
+    for msg in st.session_state.ui_history:
+        item = {k: v for k, v in msg.items() if k != "lc_count"}
+        item["attachments"] = [
+            {k: v for k, v in a.items() if k != "preview"}
+            for a in item.get("attachments", [])
+        ]
+        clean.append(item)
+    return json.dumps(clean, ensure_ascii=False, indent=2, default=str)
+
+
+with st.sidebar:
+    st.header("GigaChat")
+    credentials = st.text_input(
+        "Authorization key",
+        value=os.getenv("GIGACHAT_CREDENTIALS", ""),
+        type="password",
+    )
+    scope = st.selectbox(
+        "Scope",
+        ["GIGACHAT_API_PERS", "GIGACHAT_API_B2B", "GIGACHAT_API_CORP"],
+        index=0,
+    )
+    model = st.text_input("Model", value=os.getenv("GIGACHAT_MODEL", "GigaChat-2-Max"))
+
+    st.subheader("Generation")
+    temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.05)
+    top_p = st.slider("Top-p", 0.0, 1.0, 0.9, 0.05)
+    max_tokens = st.number_input("Max output tokens", 1, 32768, 4096, 256)
+    repetition_penalty = st.slider("Repetition penalty", 0.0, 2.0, 1.0, 0.05)
+    reasoning_effort = st.selectbox("Reasoning effort", ["off", "low", "medium", "high"])
+    show_reasoning = st.toggle("Show returned reasoning", value=True)
+
+    st.subheader("Behavior")
+    system_prompt = st.text_area(
+        "System prompt",
+        value="You are a helpful, precise assistant.",
+        height=110,
+    )
+    enable_tools = st.toggle(
+        "Enable tool calling",
+        value=False,
+        help="Includes current_datetime(). Add your own LangChain tools to TOOLS.",
+    )
+
+    with st.expander("Connection"):
+        verify_ssl = st.toggle("Verify TLS", value=True)
+        ca_bundle = st.text_input("CA bundle path", value=os.getenv("GIGACHAT_CA_BUNDLE_FILE", ""))
+        timeout = st.number_input("Timeout (sec)", 1, 3600, 180, 10)
+        max_retries = st.number_input("Retries", 0, 10, 3, 1)
+
+    c1, c2 = st.columns(2)
+    if c1.button("New chat", use_container_width=True):
+        st.session_state.lc_history = []
+        st.session_state.ui_history = []
+        st.session_state.regenerate = False
+        st.rerun()
+
+    can_regenerate = bool(st.session_state.ui_history and st.session_state.ui_history[-1]["role"] == "assistant")
+    if c2.button("Regenerate", use_container_width=True, disabled=not can_regenerate):
+        last = st.session_state.ui_history.pop()
+        del st.session_state.lc_history[-int(last.get("lc_count", 1)):]
+        st.session_state.regenerate = True
+        st.rerun()
+
+    if st.session_state.remote_file_ids:
+        if st.button("Delete uploaded API files", use_container_width=True):
+            llm = build_llm()
+            failed = []
+            for file_id in list(dict.fromkeys(st.session_state.remote_file_ids)):
+                try:
+                    llm.delete_file(file_id)
+                except Exception as e:
+                    failed.append(f"{file_id}: {e}")
+            if failed:
+                st.warning("Some files were not deleted:\n" + "\n".join(failed))
+            else:
+                st.session_state.remote_file_ids = []
+                st.success("Uploaded API files deleted.")
+
+    if st.session_state.ui_history:
+        st.download_button(
+            "Export JSON",
+            export_json(),
+            file_name="gigachat_chat.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+
+st.title("💬 GigaChat")
+st.caption("Non-streaming · history · Markdown/code · images/files/audio · reasoning · tools · usage metadata · regenerate/export")
+if not verify_ssl:
+    st.warning("TLS verification is disabled. Use that only in a trusted development environment.")
+
+render_chat()
+
+
+if st.session_state.regenerate:
+    st.session_state.regenerate = False
+    try:
+        with st.spinner("Generating…"):
+            reply, generated, events = run_llm(build_llm())
+        append_assistant(reply, generated, events)
+        st.rerun()
+    except Exception as e:
+        st.error(f"{type(e).__name__}: {e}")
+
+
+submission = st.chat_input(
+    "Message GigaChat…",
+    accept_file="multiple",
+    accept_audio=True,
+    max_upload_size=100,
+)
+
+if submission:
+    text = (getattr(submission, "text", "") or "").strip()
+    files = list(getattr(submission, "files", []) or [])
+    if getattr(submission, "audio", None) is not None:
+        files.append(submission.audio)
+
+    if text or files:
+        try:
+            llm = build_llm()
+            attachments = []
+            if files:
+                with st.spinner("Uploading attachments…"):
+                    attachments = upload_attachments(llm, files)
+
+            user_msg = make_user_message(text, attachments)
+            st.session_state.lc_history.append(user_msg)
+            st.session_state.ui_history.append(
+                {"role": "user", "text": text, "attachments": attachments}
+            )
+
+            with st.spinner("Generating…"):
+                reply, generated, events = run_llm(llm)
+            append_assistant(reply, generated, events)
+            st.rerun()
+        except Exception as e:
+            st.error(f"{type(e).__name__}: {e}")

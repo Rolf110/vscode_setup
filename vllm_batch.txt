@@ -1,0 +1,226 @@
+"""
+Батчевый инференс на OpenAI-совместимом эндпоинте (vLLM).
+
+Принимает список готовых kwargs для `chat.completions.create` — то есть
+у каждого запроса могут быть свои messages, свои tools, свой tool_choice
+и свои параметры сэмплирования. Возвращает список генераций в том же
+порядке. Asyncio спрятан внутри, вызывать можно из обычного кода.
+
+    pip install openai httpx tqdm
+"""
+
+from __future__ import annotations
+
+import asyncio
+import random
+from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+import httpx
+from openai import AsyncOpenAI
+from tqdm.auto import tqdm
+
+__all__ = ["batch_complete", "abatch_complete"]
+
+DEFAULT_URL = "http://localhost:8000/v1"
+
+
+def _merge(defaults: Mapping[str, Any], req: Mapping[str, Any]) -> dict[str, Any]:
+    """Поверх defaults кладём per-request. extra_body сливаем, а не заменяем."""
+    out = {**defaults, **req}
+    if isinstance(defaults.get("extra_body"), Mapping) and isinstance(
+        req.get("extra_body"), Mapping
+    ):
+        out["extra_body"] = {**defaults["extra_body"], **req["extra_body"]}
+    return out
+
+
+def _run_sync(coro):
+    """asyncio.run, который не падает внутри уже работающего loop (Jupyter)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+async def abatch_complete(
+    requests: Sequence[Mapping[str, Any]],
+    *,
+    model: str | None = None,
+    base_url: str | Sequence[str] = DEFAULT_URL,
+    api_key: str = "EMPTY",
+    concurrency: int = 64,
+    defaults: Mapping[str, Any] | None = None,
+    attempts: int = 3,
+    timeout: float = 600.0,
+    http_retries: int = 5,
+    progress: bool = True,
+    full: bool = False,
+    raise_on_error: bool = False,
+) -> list[Any]:
+    """Асинхронный вариант. Аргументы см. в `batch_complete`."""
+    if not requests:
+        return []
+
+    merged_defaults = dict(defaults or {})
+    if model is not None:
+        merged_defaults.setdefault("model", model)
+
+    payloads: list[dict[str, Any]] = []
+    for i, req in enumerate(requests):
+        p = _merge(merged_defaults, req)
+        if "messages" not in p:
+            raise ValueError(f"requests[{i}]: нет ключа 'messages'")
+        if "model" not in p:
+            raise ValueError(f"requests[{i}]: не задан 'model' (ни здесь, ни в defaults)")
+        payloads.append(p)
+
+    urls = [base_url] if isinstance(base_url, str) else list(base_url)
+
+    http_clients = [
+        httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=concurrency,
+                max_keepalive_connections=concurrency,
+            )
+        )
+        for _ in urls
+    ]
+    clients = [
+        AsyncOpenAI(
+            base_url=url,
+            api_key=api_key,
+            max_retries=http_retries,
+            timeout=httpx.Timeout(timeout, connect=5.0),
+            http_client=hc,
+        )
+        for url, hc in zip(urls, http_clients)
+    ]
+
+    results: list[Any] = [None] * len(payloads)
+    queue: asyncio.Queue = asyncio.Queue()
+    for i in range(len(payloads)):
+        queue.put_nowait(i)
+
+    bar = tqdm(total=len(payloads), disable=not progress, desc="batch")
+
+    async def call(client: AsyncOpenAI, payload: dict[str, Any]) -> Any:
+        last: BaseException = RuntimeError("attempts <= 0")
+        for attempt in range(attempts):
+            try:
+                return await client.chat.completions.create(**payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(2**attempt + random.random())
+        return last
+
+    async def worker(client: AsyncOpenAI) -> None:
+        # Воркеры тянут задачи из общей очереди, поэтому быстрая реплика
+        # заберёт больше работы сама — статического разбиения нет.
+        while True:
+            try:
+                i = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            results[i] = await call(client, payloads[i])
+            bar.update(1)
+
+    n_workers = min(concurrency * len(clients), len(payloads))
+    try:
+        await asyncio.gather(
+            *(
+                asyncio.create_task(worker(clients[k % len(clients)]))
+                for k in range(n_workers)
+            )
+        )
+    finally:
+        bar.close()
+        for c in clients:
+            await c.close()
+        for hc in http_clients:
+            await hc.aclose()
+
+    out: list[Any] = []
+    for res in results:
+        if isinstance(res, BaseException):
+            if raise_on_error:
+                raise res
+            out.append(res)
+        else:
+            out.append(res if full else res.choices[0].message)
+    return out
+
+
+def batch_complete(
+    requests: Sequence[Mapping[str, Any]],
+    *,
+    model: str | None = None,
+    base_url: str | Sequence[str] = DEFAULT_URL,
+    api_key: str = "EMPTY",
+    concurrency: int = 64,
+    defaults: Mapping[str, Any] | None = None,
+    attempts: int = 3,
+    timeout: float = 600.0,
+    http_retries: int = 5,
+    progress: bool = True,
+    full: bool = False,
+    raise_on_error: bool = False,
+) -> list[Any]:
+    """Прогоняет батч запросов к chat.completions и возвращает генерации по порядку.
+
+    Args:
+        requests: Список kwargs для `client.chat.completions.create`. Обязателен
+            только `messages`; `tools`, `tool_choice`, `temperature` и прочее
+            задаются поштучно и у разных элементов могут отличаться.
+        model: Модель по умолчанию. Per-request `model` её перекрывает.
+        base_url: Один адрес или список адресов. Со списком запросы
+            разбираются из общей очереди, так что реплики балансируются сами.
+        concurrency: Запросов в полёте **на одну реплику**. Пул соединений
+            httpx выставляется по этому же числу.
+        defaults: Параметры, подмешиваемые в каждый запрос. Per-request ключи
+            имеют приоритет; `extra_body` сливается по ключам, а не заменяется.
+        attempts: Повторов одного запроса при исключении. Бэкофф — вне слота.
+        timeout: Таймаут одного HTTP-запроса, секунды.
+        http_retries: Ретраи внутри SDK (429, 5xx, обрывы связи).
+        progress: Прогресс-бар.
+        full: Вернуть целиком ChatCompletion вместо `choices[0].message`
+            (нужно, если хотите usage или logprobs).
+        raise_on_error: Поднять первое исключение вместо того, чтобы положить
+            его в список результатов.
+
+    Returns:
+        Список длины `len(requests)`, выровненный по входу. Элемент — это
+        `ChatCompletionMessage` (или `ChatCompletion` при `full=True`), либо
+        экземпляр `Exception`, если запрос не удался за `attempts` попыток.
+
+    Пример:
+        >>> msgs = batch_complete(
+        ...     [{"messages": [...], "tools": [A], "tool_choice": FORCE_A},
+        ...      {"messages": [...], "tools": [B]},
+        ...      {"messages": [...]}],
+        ...     model="Qwen/Qwen3-14B",
+        ...     defaults={"temperature": 0.0, "max_completion_tokens": 512},
+        ... )
+    """
+    return _run_sync(
+        abatch_complete(
+            requests,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            concurrency=concurrency,
+            defaults=defaults,
+            attempts=attempts,
+            timeout=timeout,
+            http_retries=http_retries,
+            progress=progress,
+            full=full,
+            raise_on_error=raise_on_error,
+        )
+    )

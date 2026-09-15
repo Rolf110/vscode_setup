@@ -1,0 +1,206 @@
+"""
+Батч-обработка запросов к OpenAI-совместимому эндпоинту (vLLM) через AsyncOpenAI.
+
+Ключевая идея: семафор держится только на времени HTTP-запроса к модели,
+а не на времени всего воркера. Поэтому пока воркер делает свою работу
+(SQL, HTTP, расчёты), слот на GPU занимает другой элемент батча.
+
+    pip install openai httpx tqdm
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Generic, TypeVar
+
+import httpx
+from openai import AsyncOpenAI
+from tqdm.asyncio import tqdm_asyncio
+
+T = TypeVar("T")  # входной элемент
+R = TypeVar("R")  # результат обработки
+
+__all__ = ["LLM", "BatchOutcome", "abatch"]
+
+
+class LLM:
+    """Ручка к модели, которую получает воркер.
+
+    Семафор захватывается только вокруг самого запроса. Всё, что воркер
+    делает между вызовами `chat`, идёт вне слота.
+    """
+
+    def __init__(self, client: AsyncOpenAI, model: str, sem: asyncio.Semaphore):
+        self.client = client
+        self.model = model
+        self._sem = sem
+
+    async def chat(self, messages: list[dict[str, Any]], **kwargs: Any):
+        """Один вызов /v1/chat/completions. Возвращает message из choices[0]."""
+        async with self._sem:
+            resp = await self.client.chat.completions.create(
+                model=self.model, messages=messages, **kwargs
+            )
+        return resp.choices[0].message
+
+    async def raw(self, messages: list[dict[str, Any]], **kwargs: Any):
+        """То же, но возвращает весь ChatCompletion (нужен usage, logprobs и т.п.)."""
+        async with self._sem:
+            return await self.client.chat.completions.create(
+                model=self.model, messages=messages, **kwargs
+            )
+
+
+@dataclass
+class BatchOutcome(Generic[T, R]):
+    """Результат прогона. Порядок в `ok` соответствует порядку входных элементов."""
+
+    ok: list[tuple[T, R]] = field(default_factory=list)
+    failed: list[tuple[T, BaseException]] = field(default_factory=list)
+
+    @property
+    def values(self) -> list[R]:
+        return [v for _, v in self.ok]
+
+    def __len__(self) -> int:
+        return len(self.ok) + len(self.failed)
+
+    def summary(self) -> str:
+        total = len(self)
+        rate = len(self.ok) / total if total else 0.0
+        return f"ok={len(self.ok)} failed={len(self.failed)} ({rate:.1%})"
+
+
+async def abatch(
+    items: Sequence[T],
+    worker: Callable[[LLM, T], Awaitable[R]],
+    *,
+    model: str,
+    base_url: str = "http://localhost:8000/v1",
+    api_key: str = "EMPTY",
+    concurrency: int = 64,
+    max_tasks: int | None = None,
+    attempts: int = 3,
+    timeout: float = 600.0,
+    http_retries: int = 5,
+    progress: bool = True,
+    checkpoint: str | Path | None = None,
+    key: Callable[[T], str] | None = None,
+) -> BatchOutcome[T, R]:
+    """Прогоняет `worker` по всем `items` с ограниченной конкурентностью.
+
+    Args:
+        items: Входные элементы.
+        worker: Корутина `(llm, item) -> result`. Всю логику пишете в ней.
+        model: Имя модели, как его отдаёт `/v1/models`.
+        base_url: Адрес эндпоинта vLLM.
+        api_key: vLLM его игнорирует, если сервер поднят без --api-key.
+        concurrency: Сколько запросов к модели держать в полёте. Размер пула
+            соединений httpx выставляется по этому же числу.
+        max_tasks: Потолок одновременно обрабатываемых элементов.
+            По умолчанию concurrency * 4.
+        attempts: Сколько раз повторить воркер целиком при исключении.
+            Ставьте 1, если воркер не идемпотентен.
+        timeout: Таймаут одного HTTP-запроса, секунды.
+        http_retries: Ретраи внутри SDK (429, 5xx, обрывы связи).
+        progress: Показывать прогресс-бар.
+        checkpoint: Путь к JSONL для докатки. Уже посчитанные элементы
+            пропускаются при повторном запуске. Результат должен быть
+            JSON-сериализуемым.
+        key: Стабильный идентификатор элемента для чекпойнта.
+            По умолчанию — индекс, что ломается при изменении порядка items.
+
+    Returns:
+        BatchOutcome с разделением на успешные и упавшие элементы.
+    """
+    if not items:
+        return BatchOutcome()
+
+    keys = [key(it) if key else str(i) for i, it in enumerate(items)]
+
+    # --- докатка с чекпойнта -------------------------------------------------
+    cached: dict[str, R] = {}
+    ckpt_path = Path(checkpoint) if checkpoint else None
+    if ckpt_path is not None:
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        if ckpt_path.exists():
+            for line in ckpt_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    rec = json.loads(line)
+                    cached[rec["key"]] = rec["value"]
+
+    sem_llm = asyncio.Semaphore(concurrency)
+    sem_task = asyncio.Semaphore(max_tasks or concurrency * 4)
+    ckpt_lock = asyncio.Lock()
+    ckpt_fh = ckpt_path.open("a", encoding="utf-8") if ckpt_path else None
+
+    http_client = httpx.AsyncClient(
+        limits=httpx.Limits(
+            max_connections=concurrency,
+            max_keepalive_connections=concurrency,
+        )
+    )
+
+    try:
+        async with AsyncOpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            max_retries=http_retries,
+            timeout=httpx.Timeout(timeout, connect=5.0),
+            http_client=http_client,
+        ) as client:
+            llm = LLM(client, model, sem_llm)
+
+            async def run(k: str, item: T) -> R | BaseException:
+                # Возвращаем исключение значением, а не поднимаем: tqdm_asyncio.gather
+                # не поддерживает return_exceptions.
+                if k in cached:
+                    return cached[k]
+
+                async with sem_task:
+                    last: BaseException = RuntimeError("attempts <= 0")
+                    for attempt in range(attempts):
+                        try:
+                            value = await worker(llm, item)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:  # noqa: BLE001
+                            last = exc
+                            if attempt + 1 < attempts:
+                                await asyncio.sleep(2**attempt + random.random())
+                            continue
+
+                        if ckpt_fh is not None:
+                            async with ckpt_lock:
+                                ckpt_fh.write(
+                                    json.dumps(
+                                        {"key": k, "value": value},
+                                        ensure_ascii=False,
+                                        default=str,
+                                    )
+                                    + "\n"
+                                )
+                                ckpt_fh.flush()
+                        return value
+                    return last
+
+            coros = [run(k, it) for k, it in zip(keys, items)]
+            gather = tqdm_asyncio.gather if progress else asyncio.gather
+            raw = await gather(*coros)
+    finally:
+        if ckpt_fh is not None:
+            ckpt_fh.close()
+        await http_client.aclose()
+
+    out: BatchOutcome[T, R] = BatchOutcome()
+    for item, res in zip(items, raw):
+        if isinstance(res, BaseException):
+            out.failed.append((item, res))
+        else:
+            out.ok.append((item, res))
+    return out

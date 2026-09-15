@@ -1,0 +1,233 @@
+"""
+Полный сквозной пример: фиксированная функция + батч запросов к vLLM.
+
+Данные синтетические, поэтому скрипт запускается как есть — нужен только
+поднятый vLLM. Парсер тул-коллов НЕ нужен: вызов форсируется через
+tool_choice с именем функции, а это идёт через guided decoding.
+
+    vllm serve Qwen/Qwen3-32B
+    python example_stats.py
+
+    pip install openai httpx tqdm pydantic pandas numpy
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any, Literal
+
+import numpy as np
+import pandas as pd
+from pydantic import BaseModel, Field
+
+from abatch import LLM, abatch
+
+MODEL = "Qwen/Qwen3-32B"
+BASE_URL = "http://localhost:8000/v1"
+
+TICKERS = ("SBER", "GAZP", "LKOH", "YDEX", "ROSN")
+PERIOD_DAYS = {"1w": 7, "1m": 30, "3m": 90}
+
+
+# --- синтетическая витрина ---------------------------------------------------
+def make_frame(seed: int = 0) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range("2026-06-01", "2026-09-14", freq="D")
+    rows = []
+    for ticker in TICKERS:
+        price = rng.uniform(100, 5000)
+        for day in dates:
+            price *= 1 + rng.normal(0.0005, 0.018)
+            rows.append(
+                {
+                    "date": day,
+                    "ticker": ticker,
+                    "close": round(price, 2),
+                    "volume": int(rng.lognormal(14, 0.6)),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+DF = make_frame()
+
+
+# --- 1. Фиксированная функция ------------------------------------------------
+def get_stats(ticker: str, period: str, metric: str = "close") -> dict[str, Any]:
+    """Сводная статистика по инструменту за период. Обычная синхронная функция."""
+    sub = DF[DF["ticker"] == ticker].sort_values("date")
+    end = sub["date"].max()
+    start = end - pd.Timedelta(days=PERIOD_DAYS[period] - 1)
+    win = sub[sub["date"] >= start]
+
+    out: dict[str, Any] = {
+        "ticker": ticker,
+        "period": period,
+        "metric": metric,
+        "n_days": int(len(win)),
+        "start": str(start.date()),
+        "end": str(end.date()),
+    }
+    if win.empty:
+        return out
+
+    if metric == "volatility":
+        ret = win["close"].pct_change().dropna() * 100
+        out |= {
+            "unit": "% в день",
+            "std": round(float(ret.std()), 3),
+            "mean": round(float(ret.mean()), 3),
+            "min": round(float(ret.min()), 3),
+            "max": round(float(ret.max()), 3),
+        }
+    else:
+        s = win[metric]
+        out |= {
+            "unit": "руб." if metric == "close" else "шт.",
+            "mean": round(float(s.mean()), 2),
+            "min": round(float(s.min()), 2),
+            "max": round(float(s.max()), 2),
+            # проценты считаем здесь, а не просим модель делить в уме
+            "change_pct": round(float(s.iloc[-1] / s.iloc[0] - 1) * 100, 2),
+        }
+    return out
+
+
+# --- 2. Схема аргументов -----------------------------------------------------
+class Args(BaseModel):
+    """Всё перечислимое — через Literal: guided decoding сделает
+    невалидное значение физически недостижимым."""
+
+    ticker: Literal["SBER", "GAZP", "LKOH", "YDEX", "ROSN"] = Field(
+        description="Тикер инструмента на MOEX"
+    )
+    period: Literal["1w", "1m", "3m"] = Field(
+        description="Окно от последней доступной даты: 1w — неделя, "
+        "1m — месяц, 3m — квартал"
+    )
+    metric: Literal["close", "volume", "volatility"] = Field(
+        default="close",
+        description="close — цена закрытия, volume — объём торгов, "
+        "volatility — разброс дневной доходности",
+    )
+
+
+TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_stats",
+        "description": "Возвращает сводную статистику по инструменту MOEX за период.",
+        "parameters": Args.model_json_schema(),
+    },
+}
+FORCE_TOOL = {"type": "function", "function": {"name": "get_stats"}}
+
+
+# --- 3. Как результат показывается модели ------------------------------------
+LABELS = {
+    "mean": "Среднее",
+    "min": "Минимум",
+    "max": "Максимум",
+    "std": "Стандартное отклонение",
+    "change_pct": "Изменение за период, %",
+}
+
+
+def render(r: dict[str, Any]) -> str:
+    """Плоский подписанный текст с единицами. Не repr(), не сырой JSON."""
+    if not r["n_days"]:
+        return (
+            f"Данных по {r['ticker']} нет: окно "
+            f"{r['start']} .. {r['end']} пустое."
+        )
+    lines = [
+        f"Инструмент: {r['ticker']}",
+        f"Метрика: {r['metric']}, единицы: {r['unit']}",
+        f"Окно: {r['start']} .. {r['end']} ({r['n_days']} дней)",
+    ]
+    lines += [f"{LABELS[k]}: {r[k]}" for k in LABELS if k in r]
+    return "\n".join(lines)
+
+
+SYSTEM = (
+    "Ты аналитик рынка акций MOEX. У тебя есть функция get_stats.\n"
+    "Отвечай на русском, два-три предложения, без вступлений.\n"
+    "Опирайся строго на числа из результата функции — ничего не досчитывай "
+    "и не додумывай. Если данных нет, так и скажи."
+)
+
+
+# --- 4. Входные элементы -----------------------------------------------------
+ITEMS: list[dict[str, str]] = [
+    {"id": "q-01", "text": "Как вёл себя Сбер за последнюю неделю?"},
+    {"id": "q-02", "text": "Насколько волатилен Газпром в последний месяц?"},
+    {"id": "q-03", "text": "Какие объёмы торгов у Лукойла за три месяца?"},
+    {"id": "q-04", "text": "Яндекс за месяц вырос или упал?"},
+    {"id": "q-05", "text": "Дай сводку по Роснефти за квартал."},
+    {"id": "q-06", "text": "Что с ценой GAZP за неделю?"},
+    {"id": "q-07", "text": "Сильно ли скачет SBER в последние 30 дней?"},
+    {"id": "q-08", "text": "Объёмы по YDEX за последнюю неделю, пожалуйста."},
+]
+
+
+# --- 5. Воркер ---------------------------------------------------------------
+async def worker(llm: LLM, item: dict[str, str]) -> dict[str, Any]:
+    msgs: list[dict[str, Any]] = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": item["text"]},
+    ]
+
+    # фаза 1: только аргументы, вызов форсирован
+    m = await llm.chat(
+        msgs,
+        tools=[TOOL],
+        tool_choice=FORCE_TOOL,
+        temperature=0.0,
+        max_completion_tokens=256,
+    )
+    tool_call = m.tool_calls[0]
+    args = Args(**json.loads(tool_call.function.arguments))
+
+    # слот LLM уже отпущен — пока считается это, на GPU идёт другой элемент
+    stats = await asyncio.to_thread(get_stats, **args.model_dump())
+
+    # фаза 2: интерпретация, tools намеренно не передаём
+    msgs += [
+        m.model_dump(exclude_none=True),
+        {"role": "tool", "tool_call_id": tool_call.id, "content": render(stats)},
+    ]
+    answer = await llm.chat(msgs, temperature=0.3, max_completion_tokens=400)
+
+    return {
+        "question": item["text"],
+        "args": args.model_dump(),
+        "stats": stats,
+        "answer": answer.content,
+    }
+
+
+# --- 6. Прогон ---------------------------------------------------------------
+async def main() -> None:
+    out = await abatch(
+        ITEMS,
+        worker,
+        model=MODEL,
+        base_url=BASE_URL,
+        concurrency=16,
+        attempts=3,
+        checkpoint="runs/moex_stats.jsonl",
+        key=lambda it: it["id"],
+    )
+
+    print("\n" + out.summary())
+    for item, res in out.ok:
+        print(f"\n[{item['id']}] {res['question']}")
+        print(f"  аргументы : {res['args']}")
+        print(f"  ответ     : {res['answer']}")
+    for item, exc in out.failed:
+        print(f"\n[{item['id']}] FAILED {type(exc).__name__}: {exc}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

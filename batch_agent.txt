@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import random
 from collections.abc import Callable, Mapping, Sequence
@@ -40,6 +41,7 @@ class RunRecord:
     output: Any  # result.output
     result: Any  # AgentRunResult целиком: all_messages(), usage(), ...
     deps: Any  # объект deps этого прогона — там ваши счётчики из тулов
+    meta: Any = None  # то, что лежало в requests[i]["meta"]
 
     def messages(self) -> list[Any]:
         return self.result.all_messages()
@@ -69,6 +71,22 @@ def tool_trace(messages: Sequence[Any]) -> list[dict[str, Any]]:
                 rec["status"] = "retry"
                 rec["error"] = part.content
     return list(calls.values())
+
+
+def _run_param_names(agent: Agent) -> set[str] | None:
+    """Имена kwargs, которые принимает agent.run(). None — если проверить нельзя."""
+    try:
+        params = inspect.signature(agent.run).parameters
+    except (TypeError, ValueError):  # pragma: no cover
+        return None
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return None
+    return {
+        name
+        for name, p in params.items()
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
 
 
 def _run_sync(coro):
@@ -105,11 +123,22 @@ async def arun_agent_batch(
     base = dict(defaults or {})
     dump = dump or (lambda rec: to_jsonable_python(rec.output))
 
+    run_params = _run_param_names(agent)
+
     payloads: list[dict[str, Any]] = []
+    metas: list[Any] = []
     for i, req in enumerate(requests):
         p = {**base, **req}
         if "user_prompt" not in p:
             raise ValueError(f"requests[{i}]: нет обязательного ключа 'user_prompt'")
+        metas.append(p.pop("meta", None))
+        if run_params is not None:
+            extra = sorted(set(p) - run_params)
+            if extra:
+                raise ValueError(
+                    f"requests[{i}]: ключи {extra} не принимаются agent.run(). "
+                    "Своё кладите в 'meta' — этот ключ не форвардится."
+                )
         p.setdefault("usage_limits", UsageLimits(request_limit=request_limit))
         payloads.append(p)
 
@@ -153,7 +182,12 @@ async def arun_agent_batch(
                 if attempt + 1 < attempts:
                     await asyncio.sleep(2**attempt + random.random())
                 continue
-            return RunRecord(output=res.output, result=res, deps=payload.get("deps"))
+            return RunRecord(
+                output=res.output,
+                result=res,
+                deps=payload.get("deps"),
+                meta=metas[i],
+            )
         return last
 
     async def worker(model: Any) -> None:
@@ -231,6 +265,12 @@ def run_agent_batch(
         requests: Список kwargs для `agent.run()`. Обязателен `user_prompt`;
             `deps`, `message_history`, `output_type`, `model_settings` и прочее
             задаются поштучно и могут отличаться между элементами.
+            Ключ `meta` зарезервирован: он НЕ передаётся в `agent.run()`, а
+            складывается в `RunRecord.meta` — кладите туда свои идентификаторы
+            и любую сопроводиловку. Остальные незнакомые ключи вызывают
+            понятную ошибку до первого сетевого запроса, а не после.
+            `key` и `deps_factory` получают исходный элемент целиком,
+            вместе с `meta`.
         agent: Экземпляр `Agent`. Шарить между конкурентными прогонами безопасно —
             состояние живёт в прогоне, а не в агенте.
         models: Список моделей-реплик. Каждому прогону модель подставляется через

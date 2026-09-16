@@ -1,0 +1,290 @@
+"""
+Батчевый прогон Pydantic AI агента против одного или нескольких эндпоинтов vLLM.
+
+Принимает список kwargs для `agent.run()` — у каждого элемента свой промпт,
+свои deps, своя история. Возвращает список результатов в том же порядке.
+Конкурентность, раскладка по репликам, ретраи, чекпойнт и прогресс внутри.
+
+    pip install pydantic-ai httpx tqdm
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from pydantic_core import to_jsonable_python
+from tqdm.auto import tqdm
+
+from pydantic_ai import Agent
+from pydantic_ai.messages import RetryPromptPart, ToolCallPart, ToolReturnPart
+
+try:  # в свежих версиях реэкспортится на верхний уровень
+    from pydantic_ai import UsageLimits
+except ImportError:  # pragma: no cover
+    from pydantic_ai.usage import UsageLimits
+
+__all__ = ["RunRecord", "run_agent_batch", "arun_agent_batch", "tool_trace"]
+
+
+@dataclass
+class RunRecord:
+    """Один успешный прогон агента."""
+
+    output: Any  # result.output
+    result: Any  # AgentRunResult целиком: all_messages(), usage(), ...
+    deps: Any  # объект deps этого прогона — там ваши счётчики из тулов
+
+    def messages(self) -> list[Any]:
+        return self.result.all_messages()
+
+    def trace(self) -> list[dict[str, Any]]:
+        return tool_trace(self.result.all_messages())
+
+
+def tool_trace(messages: Sequence[Any]) -> list[dict[str, Any]]:
+    """Плоская трасса вызовов тулов: что позвали, с чем, что вернулось."""
+    calls: dict[str, dict[str, Any]] = {}
+    for msg in messages:
+        for part in getattr(msg, "parts", ()):
+            if isinstance(part, ToolCallPart):
+                calls[part.tool_call_id] = {
+                    "tool": part.tool_name,
+                    "args": part.args_as_dict(),
+                    "result": None,
+                    "status": "no_result",
+                }
+            elif isinstance(part, ToolReturnPart):
+                rec = calls.setdefault(part.tool_call_id, {"tool": part.tool_name})
+                rec["result"] = part.content
+                rec["status"] = getattr(part, "outcome", None) or "ok"
+            elif isinstance(part, RetryPromptPart):
+                rec = calls.setdefault(part.tool_call_id, {"tool": part.tool_name})
+                rec["status"] = "retry"
+                rec["error"] = part.content
+    return list(calls.values())
+
+
+def _run_sync(coro):
+    """asyncio.run, который не падает внутри уже работающего loop (Jupyter)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+async def arun_agent_batch(
+    requests: Sequence[Mapping[str, Any]],
+    agent: Agent,
+    *,
+    models: Sequence[Any] | None = None,
+    concurrency: int = 96,
+    deps_factory: Callable[[Mapping[str, Any]], Any] | None = None,
+    defaults: Mapping[str, Any] | None = None,
+    request_limit: int = 6,
+    attempts: int = 2,
+    progress: bool = True,
+    full: bool = False,
+    checkpoint: str | Path | None = None,
+    key: Callable[[Mapping[str, Any]], str] | None = None,
+    dump: Callable[[RunRecord], Any] | None = None,
+) -> list[Any]:
+    """Асинхронный вариант. Аргументы см. в `run_agent_batch`."""
+    if not requests:
+        return []
+
+    model_list: list[Any] = list(models) if models else [None]
+    base = dict(defaults or {})
+    dump = dump or (lambda rec: to_jsonable_python(rec.output))
+
+    payloads: list[dict[str, Any]] = []
+    for i, req in enumerate(requests):
+        p = {**base, **req}
+        if "user_prompt" not in p:
+            raise ValueError(f"requests[{i}]: нет обязательного ключа 'user_prompt'")
+        p.setdefault("usage_limits", UsageLimits(request_limit=request_limit))
+        payloads.append(p)
+
+    keys = [key(r) if key else str(i) for i, r in enumerate(requests)]
+
+    cached: dict[str, Any] = {}
+    ckpt_path = Path(checkpoint) if checkpoint else None
+    if ckpt_path is not None:
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        if ckpt_path.exists():
+            for line in ckpt_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    rec = json.loads(line)
+                    cached[rec["key"]] = rec["value"]
+
+    results: list[Any] = [None] * len(payloads)
+    queue: asyncio.Queue = asyncio.Queue()
+    for i in range(len(payloads)):
+        queue.put_nowait(i)
+
+    bar = tqdm(total=len(payloads), disable=not progress, desc="agent")
+    ckpt_lock = asyncio.Lock()
+    ckpt_fh = ckpt_path.open("a", encoding="utf-8") if ckpt_path else None
+
+    async def one(i: int, model: Any) -> RunRecord | BaseException:
+        payload = dict(payloads[i])
+        if model is not None:
+            payload.setdefault("model", model)
+
+        last: BaseException = RuntimeError("attempts <= 0")
+        for attempt in range(attempts):
+            # deps мутабельны (счётчики вызовов), поэтому на каждую попытку — свои
+            if deps_factory is not None and "deps" not in requests[i]:
+                payload["deps"] = deps_factory(requests[i])
+            try:
+                res = await agent.run(**payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(2**attempt + random.random())
+                continue
+            return RunRecord(output=res.output, result=res, deps=payload.get("deps"))
+        return last
+
+    async def worker(model: Any) -> None:
+        # Воркеры тянут индексы из общей очереди — быстрая реплика заберёт больше.
+        while True:
+            try:
+                i = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+            k = keys[i]
+            if k in cached:
+                results[i] = cached[k]
+                bar.update(1)
+                continue
+
+            rec = await one(i, model)
+            results[i] = rec
+            if ckpt_fh is not None and isinstance(rec, RunRecord):
+                async with ckpt_lock:
+                    ckpt_fh.write(
+                        json.dumps(
+                            {"key": k, "value": dump(rec)},
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                        + "\n"
+                    )
+                    ckpt_fh.flush()
+            bar.update(1)
+
+    n_workers = min(concurrency * len(model_list), len(payloads))
+    try:
+        await asyncio.gather(
+            *(
+                asyncio.create_task(worker(model_list[k % len(model_list)]))
+                for k in range(n_workers)
+            )
+        )
+    finally:
+        bar.close()
+        if ckpt_fh is not None:
+            ckpt_fh.close()
+
+    out: list[Any] = []
+    for r in results:
+        if isinstance(r, BaseException):
+            out.append(r)
+        elif isinstance(r, RunRecord):
+            out.append(r if full else r.output)
+        else:
+            out.append(r)  # восстановлено из чекпойнта — уже в форме dump()
+    return out
+
+
+def run_agent_batch(
+    requests: Sequence[Mapping[str, Any]],
+    agent: Agent,
+    *,
+    models: Sequence[Any] | None = None,
+    concurrency: int = 96,
+    deps_factory: Callable[[Mapping[str, Any]], Any] | None = None,
+    defaults: Mapping[str, Any] | None = None,
+    request_limit: int = 6,
+    attempts: int = 2,
+    progress: bool = True,
+    full: bool = False,
+    checkpoint: str | Path | None = None,
+    key: Callable[[Mapping[str, Any]], str] | None = None,
+    dump: Callable[[RunRecord], Any] | None = None,
+) -> list[Any]:
+    """Прогоняет агента по батчу запросов и возвращает выходы по порядку.
+
+    Args:
+        requests: Список kwargs для `agent.run()`. Обязателен `user_prompt`;
+            `deps`, `message_history`, `output_type`, `model_settings` и прочее
+            задаются поштучно и могут отличаться между элементами.
+        agent: Экземпляр `Agent`. Шарить между конкурентными прогонами безопасно —
+            состояние живёт в прогоне, а не в агенте.
+        models: Список моделей-реплик. Каждому прогону модель подставляется через
+            `model=` в `run()`, так что четыре эндпоинта обслуживаются без прокси.
+            `None` — использовать модель агента по умолчанию.
+        concurrency: Воркеров **на реплику**. Внимание: воркер держит задачу весь
+            прогон (модель → тул → модель), а на GPU в каждый момент уходит не
+            более одного его запроса. Поэтому `Running: N reqs` в логах vLLM будет
+            ниже числа воркеров — поднимайте `concurrency` выше, чем для голых
+            completions.
+        deps_factory: Как построить `deps` из элемента. Вызывается на каждую
+            попытку заново, чтобы мутабельное состояние (счётчики вызовов тулов)
+            не текло между ретраями и между элементами. Игнорируется, если
+            элемент задал `deps` явно.
+        defaults: Kwargs, подмешиваемые в каждый запрос; per-request перекрывают.
+        request_limit: Потолок запросов к модели на один прогон. С auto tool
+            choice число шагов не фиксировано, и без лимита запутавшийся элемент
+            съест дефолтные 50, заняв воркера на минуты.
+        attempts: Повторов всего прогона при исключении. Это поверх `ModelRetry`,
+            который чинит невалидные аргументы внутри прогона.
+        progress: Прогресс-бар.
+        full: Вернуть `RunRecord` (output + AgentRunResult + deps) вместо голого
+            `result.output`.
+        checkpoint: JSONL для докатки. Элементы из файла не перезапускаются.
+        key: Стабильный идентификатор элемента для чекпойнта. По умолчанию индекс,
+            что ломается при изменении порядка `requests`.
+        dump: Как сериализовать `RunRecord` в чекпойнт. По умолчанию — только
+            `output`. Чтобы сохранить и трассу, передайте, например,
+            `lambda r: {"output": to_jsonable_python(r.output),
+                        "messages": r.result.all_messages_json().decode()}`.
+
+    Returns:
+        Список длины `len(requests)`, выровненный по входу. Элемент — это
+        `result.output` (или `RunRecord` при `full=True`), либо `Exception`,
+        если прогон не удался за `attempts` попыток.
+
+        Осторожно: элементы, восстановленные из чекпойнта, возвращаются в форме
+        `dump()`, а не как `RunRecord`. При `full=True` вместе с `checkpoint`
+        типы в списке смешаются — подгоняйте `dump` под свой сценарий.
+    """
+    return _run_sync(
+        arun_agent_batch(
+            requests,
+            agent,
+            models=models,
+            concurrency=concurrency,
+            deps_factory=deps_factory,
+            defaults=defaults,
+            request_limit=request_limit,
+            attempts=attempts,
+            progress=progress,
+            full=full,
+            checkpoint=checkpoint,
+            key=key,
+            dump=dump,
+        )
+    )

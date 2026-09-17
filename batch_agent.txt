@@ -1,9 +1,12 @@
 """
-Батчевый прогон Pydantic AI агента против одного или нескольких эндпоинтов vLLM.
+Простой батчевый прогон Pydantic AI агента против vLLM. Без дедлоков.
 
-Принимает список kwargs для `agent.run()` — у каждого элемента свой промпт,
-свои deps, своя история. Возвращает список результатов в том же порядке.
-Конкурентность, раскладка по репликам, ретраи, чекпойнт и прогресс внутри.
+Главное правило, из-за нарушения которого всё и висло: httpx-клиент и модель
+создаются ВНУТРИ вызова, в том же event loop, где идёт работа. Ничего не
+переживает вызов, ничего не привязывается к чужому циклу.
+
+В Jupyter:   runs = await abatch_run(agent, items, model=..., deps_factory=...)
+В скрипте:   runs = batch_run(agent, items, model=..., deps_factory=...)
 
     pip install pydantic-ai httpx tqdm
 """
@@ -11,320 +14,257 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
-import random
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic_core import to_jsonable_python
+import httpx
 from tqdm.auto import tqdm
 
 from pydantic_ai import Agent
-from pydantic_ai.messages import RetryPromptPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.vllm import VLLMProvider
 
-try:  # в свежих версиях реэкспортится на верхний уровень
+try:
     from pydantic_ai import UsageLimits
 except ImportError:  # pragma: no cover
     from pydantic_ai.usage import UsageLimits
 
-__all__ = ["RunRecord", "run_agent_batch", "arun_agent_batch", "tool_trace"]
+__all__ = ["Run", "abatch_run", "batch_run", "summary"]
+
+# Ключи элемента, которые можно передать в agent.run(). Всё остальное — ваше.
+_PASSTHROUGH = frozenset(
+    {"user_prompt", "message_history", "output_type", "model_settings", "deps"}
+)
 
 
 @dataclass
-class RunRecord:
-    """Один успешный прогон агента."""
+class Run:
+    """Результат одного элемента. Проверяйте `.ok`, а не isinstance."""
 
-    output: Any  # result.output
-    result: Any  # AgentRunResult целиком: all_messages(), usage(), ...
-    deps: Any  # объект deps этого прогона — там ваши счётчики из тулов
-    meta: Any = None  # то, что лежало в requests[i]["meta"]
+    index: int
+    output: Any = None
+    error: BaseException | None = None
+    meta: Any = None
+    deps: Any = None  # объект deps этого прогона — ваши счётчики из тулов
+    result: Any = None  # AgentRunResult: all_messages(), usage(), ...
+    attempts: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
 
     def messages(self) -> list[Any]:
-        return self.result.all_messages()
-
-    def trace(self) -> list[dict[str, Any]]:
-        return tool_trace(self.result.all_messages())
+        return self.result.all_messages() if self.result is not None else []
 
 
-def tool_trace(messages: Sequence[Any]) -> list[dict[str, Any]]:
-    """Плоская трасса вызовов тулов: что позвали, с чем, что вернулось."""
-    calls: dict[str, dict[str, Any]] = {}
-    for msg in messages:
-        for part in getattr(msg, "parts", ()):
-            if isinstance(part, ToolCallPart):
-                calls[part.tool_call_id] = {
-                    "tool": part.tool_name,
-                    "args": part.args_as_dict(),
-                    "result": None,
-                    "status": "no_result",
-                }
-            elif isinstance(part, ToolReturnPart):
-                rec = calls.setdefault(part.tool_call_id, {"tool": part.tool_name})
-                rec["result"] = part.content
-                rec["status"] = getattr(part, "outcome", None) or "ok"
-            elif isinstance(part, RetryPromptPart):
-                rec = calls.setdefault(part.tool_call_id, {"tool": part.tool_name})
-                rec["status"] = "retry"
-                rec["error"] = part.content
-    return list(calls.values())
+def summary(runs: Sequence[Run]) -> str:
+    ok = sum(r.ok for r in runs)
+    return f"ok={ok} failed={len(runs) - ok} из {len(runs)}"
 
 
-def _run_param_names(agent: Agent) -> set[str] | None:
-    """Имена kwargs, которые принимает agent.run(). None — если проверить нельзя."""
+def _normalize(item: Any) -> dict[str, Any]:
+    if isinstance(item, str):
+        return {"user_prompt": item}
+    if isinstance(item, Mapping):
+        d = dict(item)
+        if "user_prompt" not in d:
+            raise ValueError(f"в элементе нет 'user_prompt': {d!r}")
+        return d
+    raise TypeError(f"элемент должен быть str или Mapping, получен {type(item).__name__}")
+
+
+async def _preflight(http: httpx.AsyncClient, base_url: str, model: str, api_key: str,
+                     timeout: float) -> None:
+    """Быстрая проверка, что эндпоинт жив и модель на нём есть."""
+    url = base_url.rstrip("/") + "/models"
     try:
-        params = inspect.signature(agent.run).parameters
-    except (TypeError, ValueError):  # pragma: no cover
-        return None
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return None
-    return {
-        name
-        for name, p in params.items()
-        if p.kind
-        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-    }
+        resp = await http.get(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=httpx.Timeout(timeout, connect=timeout),
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Эндпоинт {base_url} не отвечает ({type(exc).__name__}: {exc}). "
+            "Батч не запущен — проверьте, что vLLM поднят на этом адресе."
+        ) from exc
+
+    served = [m.get("id") for m in resp.json().get("data", [])]
+    if model not in served:
+        raise RuntimeError(
+            f"Модель {model!r} не найдена на {base_url}. Доступны: {served}. "
+            "Возьмите имя из этого списка или задайте --served-model-name."
+        )
 
 
-def _run_sync(coro):
-    """asyncio.run, который не падает внутри уже работающего loop (Jupyter)."""
+def _make_debug_hook(budget: dict[str, int]) -> Callable:
+    async def hook(request: httpx.Request) -> None:
+        if budget["left"] <= 0 or not request.url.path.endswith("/chat/completions"):
+            return
+        budget["left"] -= 1
+        body = json.loads(request.content)
+        print(
+            json.dumps(
+                {
+                    "messages": body.get("messages"),
+                    "tools": body.get("tools"),
+                    "tool_choice": body.get("tool_choice"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
+    return hook
+
+
+async def abatch_run(
+    agent: Agent,
+    items: Sequence[Any],
+    *,
+    model: str,
+    base_url: str = "http://localhost:8000/v1",
+    api_key: str = "EMPTY",
+    concurrency: int = 32,
+    deps_factory: Callable[[Mapping[str, Any]], Any] | None = None,
+    request_limit: int = 6,
+    attempts: int = 2,
+    http_timeout: float = 180.0,
+    item_timeout: float = 600.0,
+    connect_timeout: float = 5.0,
+    preflight: bool = True,
+    progress: bool = True,
+    debug_requests: int = 0,
+    run_kwargs: Mapping[str, Any] | None = None,
+) -> list[Run]:
+    """Прогоняет агента по списку элементов. Возвращает список `Run` по порядку.
+
+    Args:
+        agent: `Agent` с зарегистрированными тулами. Модель ему не нужна —
+            она собирается здесь и подставляется в каждый прогон.
+        items: Список строк-промптов, либо словарей с `user_prompt` и, по
+            желанию, `meta` / `deps` / `message_history` / `output_type` /
+            `model_settings`. Ключ `meta` в `agent.run()` не уходит.
+        model: Имя модели, как его отдаёт `/v1/models`.
+        concurrency: Сколько элементов обрабатывать одновременно. Воркер занят
+            весь прогон (модель → тул → модель), а на GPU в каждый момент идёт
+            максимум один его запрос — так что ставьте выше, чем для голых
+            completions.
+        deps_factory: Как построить `deps` из элемента; вызывается заново на
+            каждую попытку, чтобы мутабельное состояние не текло между ними.
+        request_limit: Потолок запросов к модели на один прогон.
+        attempts: Повторов прогона при исключении или таймауте.
+        http_timeout: Таймаут одного HTTP-запроса.
+        item_timeout: Таймаут всего прогона элемента, включая тулы и ретраи
+            внутри pydantic-ai. Жёсткий: по нему элемент снимается.
+        connect_timeout: Таймаут установки соединения. Маленький намеренно —
+            мёртвый порт должен давать ошибку за секунды, а не висеть.
+        preflight: Проверить доступность эндпоинта и наличие модели до старта.
+        debug_requests: Напечатать тела первых N запросов к /chat/completions.
+        run_kwargs: Общие kwargs, добавляемые в каждый `agent.run()`.
+
+    Returns:
+        Список `Run` той же длины и в том же порядке, что `items`. Ошибки
+        лежат в `Run.error`, а не подменяют тип элемента.
+    """
+    norm = [_normalize(it) for it in items]
+    if not norm:
+        return []
+
+    runs = [Run(index=i, meta=it.get("meta")) for i, it in enumerate(norm)]
+
+    hooks: dict[str, list] = {}
+    if debug_requests > 0:
+        hooks["request"] = [_make_debug_hook({"left": debug_requests})]
+
+    # Всё внутри: клиент живёт ровно столько, сколько этот вызов.
+    async with httpx.AsyncClient(
+        limits=httpx.Limits(
+            max_connections=concurrency, max_keepalive_connections=concurrency
+        ),
+        timeout=httpx.Timeout(http_timeout, connect=connect_timeout),
+        event_hooks=hooks,
+    ) as http:
+        if preflight:
+            await _preflight(http, base_url, model, api_key, connect_timeout)
+
+        llm = OpenAIChatModel(
+            model,
+            provider=VLLMProvider(base_url=base_url, api_key=api_key, http_client=http),
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        for i in range(len(norm)):
+            queue.put_nowait(i)
+        bar = tqdm(total=len(norm), disable=not progress, desc="agent")
+
+        async def one(i: int) -> None:
+            item, run = norm[i], runs[i]
+            for attempt in range(1, attempts + 1):
+                run.attempts = attempt
+
+                kwargs: dict[str, Any] = dict(run_kwargs or {})
+                kwargs.update({k: v for k, v in item.items() if k in _PASSTHROUGH})
+                if "deps" not in kwargs and deps_factory is not None:
+                    kwargs["deps"] = deps_factory(item)
+                kwargs["model"] = llm
+                kwargs.setdefault("usage_limits", UsageLimits(request_limit=request_limit))
+
+                try:
+                    res = await asyncio.wait_for(agent.run(**kwargs), timeout=item_timeout)
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    run.error = TimeoutError(
+                        f"элемент {i}: прогон не уложился в item_timeout={item_timeout}s"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    run.error = exc
+                else:
+                    run.output, run.result = res.output, res
+                    run.deps, run.error = kwargs.get("deps"), None
+                    return
+
+                if attempt < attempts:
+                    await asyncio.sleep(2**attempt)
+
+        async def worker() -> None:
+            while True:
+                try:
+                    i = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                await one(i)
+                bar.update(1)
+
+        try:
+            await asyncio.gather(
+                *(
+                    asyncio.create_task(worker())
+                    for _ in range(min(concurrency, len(norm)))
+                )
+            )
+        finally:
+            bar.close()
+
+    return runs
+
+
+def batch_run(agent: Agent, items: Sequence[Any], **kwargs: Any) -> list[Run]:
+    """Синхронная обёртка. В Jupyter лучше `await abatch_run(...)` напрямую.
+
+    Безопасна и при уже работающем цикле: корутина уходит в отдельный поток со
+    своим циклом, а httpx-клиент создаётся внутри неё, так что привязки к чужому
+    циклу не возникает.
+    """
+    coro_factory = lambda: abatch_run(agent, items, **kwargs)  # noqa: E731
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
+        return asyncio.run(coro_factory())
     with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
-
-
-async def arun_agent_batch(
-    requests: Sequence[Mapping[str, Any]],
-    agent: Agent,
-    *,
-    models: Sequence[Any] | None = None,
-    concurrency: int = 96,
-    deps_factory: Callable[[Mapping[str, Any]], Any] | None = None,
-    defaults: Mapping[str, Any] | None = None,
-    request_limit: int = 6,
-    attempts: int = 2,
-    progress: bool = True,
-    full: bool = False,
-    checkpoint: str | Path | None = None,
-    key: Callable[[Mapping[str, Any]], str] | None = None,
-    dump: Callable[[RunRecord], Any] | None = None,
-) -> list[Any]:
-    """Асинхронный вариант. Аргументы см. в `run_agent_batch`."""
-    if not requests:
-        return []
-
-    model_list: list[Any] = list(models) if models else [None]
-    base = dict(defaults or {})
-    dump = dump or (lambda rec: to_jsonable_python(rec.output))
-
-    run_params = _run_param_names(agent)
-
-    payloads: list[dict[str, Any]] = []
-    metas: list[Any] = []
-    for i, req in enumerate(requests):
-        p = {**base, **req}
-        if "user_prompt" not in p:
-            raise ValueError(f"requests[{i}]: нет обязательного ключа 'user_prompt'")
-        metas.append(p.pop("meta", None))
-        if run_params is not None:
-            extra = sorted(set(p) - run_params)
-            if extra:
-                raise ValueError(
-                    f"requests[{i}]: ключи {extra} не принимаются agent.run(). "
-                    "Своё кладите в 'meta' — этот ключ не форвардится."
-                )
-        p.setdefault("usage_limits", UsageLimits(request_limit=request_limit))
-        payloads.append(p)
-
-    keys = [key(r) if key else str(i) for i, r in enumerate(requests)]
-
-    cached: dict[str, Any] = {}
-    ckpt_path = Path(checkpoint) if checkpoint else None
-    if ckpt_path is not None:
-        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-        if ckpt_path.exists():
-            for line in ckpt_path.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    rec = json.loads(line)
-                    cached[rec["key"]] = rec["value"]
-
-    results: list[Any] = [None] * len(payloads)
-    queue: asyncio.Queue = asyncio.Queue()
-    for i in range(len(payloads)):
-        queue.put_nowait(i)
-
-    bar = tqdm(total=len(payloads), disable=not progress, desc="agent")
-    ckpt_lock = asyncio.Lock()
-    ckpt_fh = ckpt_path.open("a", encoding="utf-8") if ckpt_path else None
-
-    async def one(i: int, model: Any) -> RunRecord | BaseException:
-        payload = dict(payloads[i])
-        if model is not None:
-            payload.setdefault("model", model)
-
-        last: BaseException = RuntimeError("attempts <= 0")
-        for attempt in range(attempts):
-            # deps мутабельны (счётчики вызовов), поэтому на каждую попытку — свои
-            if deps_factory is not None and "deps" not in requests[i]:
-                payload["deps"] = deps_factory(requests[i])
-            try:
-                res = await agent.run(**payload)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                last = exc
-                if attempt + 1 < attempts:
-                    await asyncio.sleep(2**attempt + random.random())
-                continue
-            return RunRecord(
-                output=res.output,
-                result=res,
-                deps=payload.get("deps"),
-                meta=metas[i],
-            )
-        return last
-
-    async def worker(model: Any) -> None:
-        # Воркеры тянут индексы из общей очереди — быстрая реплика заберёт больше.
-        while True:
-            try:
-                i = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return
-
-            k = keys[i]
-            if k in cached:
-                results[i] = cached[k]
-                bar.update(1)
-                continue
-
-            rec = await one(i, model)
-            results[i] = rec
-            if ckpt_fh is not None and isinstance(rec, RunRecord):
-                async with ckpt_lock:
-                    ckpt_fh.write(
-                        json.dumps(
-                            {"key": k, "value": dump(rec)},
-                            ensure_ascii=False,
-                            default=str,
-                        )
-                        + "\n"
-                    )
-                    ckpt_fh.flush()
-            bar.update(1)
-
-    n_workers = min(concurrency * len(model_list), len(payloads))
-    try:
-        await asyncio.gather(
-            *(
-                asyncio.create_task(worker(model_list[k % len(model_list)]))
-                for k in range(n_workers)
-            )
-        )
-    finally:
-        bar.close()
-        if ckpt_fh is not None:
-            ckpt_fh.close()
-
-    out: list[Any] = []
-    for r in results:
-        if isinstance(r, BaseException):
-            out.append(r)
-        elif isinstance(r, RunRecord):
-            out.append(r if full else r.output)
-        else:
-            out.append(r)  # восстановлено из чекпойнта — уже в форме dump()
-    return out
-
-
-def run_agent_batch(
-    requests: Sequence[Mapping[str, Any]],
-    agent: Agent,
-    *,
-    models: Sequence[Any] | None = None,
-    concurrency: int = 96,
-    deps_factory: Callable[[Mapping[str, Any]], Any] | None = None,
-    defaults: Mapping[str, Any] | None = None,
-    request_limit: int = 6,
-    attempts: int = 2,
-    progress: bool = True,
-    full: bool = False,
-    checkpoint: str | Path | None = None,
-    key: Callable[[Mapping[str, Any]], str] | None = None,
-    dump: Callable[[RunRecord], Any] | None = None,
-) -> list[Any]:
-    """Прогоняет агента по батчу запросов и возвращает выходы по порядку.
-
-    Args:
-        requests: Список kwargs для `agent.run()`. Обязателен `user_prompt`;
-            `deps`, `message_history`, `output_type`, `model_settings` и прочее
-            задаются поштучно и могут отличаться между элементами.
-            Ключ `meta` зарезервирован: он НЕ передаётся в `agent.run()`, а
-            складывается в `RunRecord.meta` — кладите туда свои идентификаторы
-            и любую сопроводиловку. Остальные незнакомые ключи вызывают
-            понятную ошибку до первого сетевого запроса, а не после.
-            `key` и `deps_factory` получают исходный элемент целиком,
-            вместе с `meta`.
-        agent: Экземпляр `Agent`. Шарить между конкурентными прогонами безопасно —
-            состояние живёт в прогоне, а не в агенте.
-        models: Список моделей-реплик. Каждому прогону модель подставляется через
-            `model=` в `run()`, так что четыре эндпоинта обслуживаются без прокси.
-            `None` — использовать модель агента по умолчанию.
-        concurrency: Воркеров **на реплику**. Внимание: воркер держит задачу весь
-            прогон (модель → тул → модель), а на GPU в каждый момент уходит не
-            более одного его запроса. Поэтому `Running: N reqs` в логах vLLM будет
-            ниже числа воркеров — поднимайте `concurrency` выше, чем для голых
-            completions.
-        deps_factory: Как построить `deps` из элемента. Вызывается на каждую
-            попытку заново, чтобы мутабельное состояние (счётчики вызовов тулов)
-            не текло между ретраями и между элементами. Игнорируется, если
-            элемент задал `deps` явно.
-        defaults: Kwargs, подмешиваемые в каждый запрос; per-request перекрывают.
-        request_limit: Потолок запросов к модели на один прогон. С auto tool
-            choice число шагов не фиксировано, и без лимита запутавшийся элемент
-            съест дефолтные 50, заняв воркера на минуты.
-        attempts: Повторов всего прогона при исключении. Это поверх `ModelRetry`,
-            который чинит невалидные аргументы внутри прогона.
-        progress: Прогресс-бар.
-        full: Вернуть `RunRecord` (output + AgentRunResult + deps) вместо голого
-            `result.output`.
-        checkpoint: JSONL для докатки. Элементы из файла не перезапускаются.
-        key: Стабильный идентификатор элемента для чекпойнта. По умолчанию индекс,
-            что ломается при изменении порядка `requests`.
-        dump: Как сериализовать `RunRecord` в чекпойнт. По умолчанию — только
-            `output`. Чтобы сохранить и трассу, передайте, например,
-            `lambda r: {"output": to_jsonable_python(r.output),
-                        "messages": r.result.all_messages_json().decode()}`.
-
-    Returns:
-        Список длины `len(requests)`, выровненный по входу. Элемент — это
-        `result.output` (или `RunRecord` при `full=True`), либо `Exception`,
-        если прогон не удался за `attempts` попыток.
-
-        Осторожно: элементы, восстановленные из чекпойнта, возвращаются в форме
-        `dump()`, а не как `RunRecord`. При `full=True` вместе с `checkpoint`
-        типы в списке смешаются — подгоняйте `dump` под свой сценарий.
-    """
-    return _run_sync(
-        arun_agent_batch(
-            requests,
-            agent,
-            models=models,
-            concurrency=concurrency,
-            deps_factory=deps_factory,
-            defaults=defaults,
-            request_limit=request_limit,
-            attempts=attempts,
-            progress=progress,
-            full=full,
-            checkpoint=checkpoint,
-            key=key,
-            dump=dump,
-        )
-    )
+        return pool.submit(lambda: asyncio.run(coro_factory())).result()

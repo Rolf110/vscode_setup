@@ -32,12 +32,41 @@ try:
 except ImportError:  # pragma: no cover
     from pydantic_ai.usage import UsageLimits
 
-__all__ = ["Run", "abatch_run", "batch_run", "summary"]
+try:
+    from pydantic_ai import capture_run_messages
+except ImportError:  # pragma: no cover — старые версии, историю упавших не соберём
+    from contextlib import contextmanager
+
+    @contextmanager
+    def capture_run_messages():  # type: ignore[misc]
+        yield []
+
+
+__all__ = ["Run", "abatch_run", "batch_run", "summary", "print_steps"]
+
+# part_kind -> человекочитаемое имя шага
+_KIND = {
+    "system-prompt": "system",
+    "user-prompt": "user",
+    "thinking": "thinking",
+    "text": "text",
+    "tool-call": "tool_call",
+    "tool-return": "tool_return",
+    "retry-prompt": "retry",
+    "builtin-tool-call": "builtin_tool_call",
+    "builtin-tool-return": "builtin_tool_return",
+}
 
 # Ключи элемента, которые можно передать в agent.run(). Всё остальное — ваше.
 _PASSTHROUGH = frozenset(
     {"user_prompt", "message_history", "output_type", "model_settings", "deps"}
 )
+
+
+def _clip(value: Any, limit: int | None) -> Any:
+    if limit is None or not isinstance(value, str) or len(value) <= limit:
+        return value
+    return value[:limit] + f"… (+{len(value) - limit} симв.)"
 
 
 @dataclass
@@ -49,15 +78,79 @@ class Run:
     error: BaseException | None = None
     meta: Any = None
     deps: Any = None  # объект deps этого прогона — ваши счётчики из тулов
-    result: Any = None  # AgentRunResult: all_messages(), usage(), ...
+    result: Any = None  # AgentRunResult; None, если прогон упал
+    messages: list[Any] = field(default_factory=list)  # история, в т.ч. у упавших
     attempts: int = 0
 
     @property
     def ok(self) -> bool:
         return self.error is None
 
-    def messages(self) -> list[Any]:
-        return self.result.all_messages() if self.result is not None else []
+    def steps(
+        self, *, include_system: bool = False, truncate: int | None = 400
+    ) -> list[dict[str, Any]]:
+        """Плоская лента: что агент думал, что вызвал, с чем и что получил.
+
+        `turn` — номер обращения к модели, по нему видно, сколько было
+        round-trip'ов. Порядок шагов — хронологический.
+        """
+        out: list[dict[str, Any]] = []
+        turn = 0
+        for msg in self.messages:
+            if type(msg).__name__ == "ModelResponse":
+                turn += 1
+            for part in getattr(msg, "parts", ()):
+                raw_kind = getattr(part, "part_kind", type(part).__name__)
+                if raw_kind == "system-prompt" and not include_system:
+                    continue
+
+                entry: dict[str, Any] = {
+                    "n": len(out),
+                    "turn": turn,
+                    "kind": _KIND.get(raw_kind, raw_kind),
+                }
+                if raw_kind in ("tool-call", "builtin-tool-call"):
+                    entry["tool"] = part.tool_name
+                    try:
+                        entry["args"] = part.args_as_dict()
+                    except Exception:  # noqa: BLE001 — модель прислала не-JSON
+                        entry["args"] = part.args
+                    entry["call_id"] = getattr(part, "tool_call_id", None)
+                elif raw_kind in ("tool-return", "retry-prompt", "builtin-tool-return"):
+                    entry["tool"] = getattr(part, "tool_name", None)
+                    entry["content"] = _clip(getattr(part, "content", None), truncate)
+                    entry["call_id"] = getattr(part, "tool_call_id", None)
+                    if outcome := getattr(part, "outcome", None):
+                        entry["outcome"] = outcome
+                elif hasattr(part, "content"):
+                    entry["content"] = _clip(part.content, truncate)
+                else:
+                    entry["repr"] = _clip(str(part), truncate)
+                out.append(entry)
+        return out
+
+    def messages_json(self) -> str:
+        """История в JSON — для чекпойнта или отправки в хранилище."""
+        if self.result is not None:
+            return self.result.all_messages_json().decode()
+        from pydantic_ai.messages import ModelMessagesTypeAdapter
+
+        return ModelMessagesTypeAdapter.dump_json(self.messages).decode()
+
+
+def print_steps(run: Run, *, truncate: int | None = 200) -> None:
+    """Печатает ленту шагов одного прогона в читаемом виде."""
+    head = f"#{run.index}" + (f" {run.meta}" if run.meta is not None else "")
+    print(f"=== {head} — {'ok' if run.ok else f'FAILED: {run.error!r}'}")
+    for s in run.steps(truncate=truncate):
+        prefix = f"  [{s['turn']}] {s['kind']:<18}"
+        if s["kind"] in ("tool_call", "builtin_tool_call"):
+            print(f"{prefix} {s['tool']}({s.get('args')})")
+        elif "tool" in s:
+            mark = f" [{s['outcome']}]" if "outcome" in s else ""
+            print(f"{prefix} {s['tool']}{mark} -> {s.get('content')}")
+        else:
+            print(f"{prefix} {s.get('content', s.get('repr'))}")
 
 
 def summary(runs: Sequence[Run]) -> str:
@@ -170,6 +263,12 @@ async def abatch_run(
     Returns:
         Список `Run` той же длины и в том же порядке, что `items`. Ошибки
         лежат в `Run.error`, а не подменяют тип элемента.
+
+        В `Run.messages` — полная история прогона в формате pydantic-ai, в том
+        числе у упавших элементов (собирается через `capture_run_messages`).
+        `Run.steps()` разворачивает её в плоскую хронологическую ленту:
+        размышления, вызовы тулов с аргументами, их результаты, ретраи и
+        финальный текст. `print_steps(run)` печатает то же читаемо.
     """
     norm = [_normalize(it) for it in items]
     if not norm:
@@ -215,17 +314,27 @@ async def abatch_run(
                 kwargs.setdefault("usage_limits", UsageLimits(request_limit=request_limit))
 
                 try:
-                    res = await asyncio.wait_for(agent.run(**kwargs), timeout=item_timeout)
+                    # Свой контекст на каждую попытку: capture_run_messages ловит
+                    # только первый run внутри блока.
+                    with capture_run_messages() as captured:
+                        res = await asyncio.wait_for(
+                            agent.run(**kwargs), timeout=item_timeout
+                        )
                 except asyncio.CancelledError:
                     raise
                 except asyncio.TimeoutError:
                     run.error = TimeoutError(
                         f"элемент {i}: прогон не уложился в item_timeout={item_timeout}s"
                     )
+                    run.messages = list(captured)
+                    run.deps = kwargs.get("deps")
                 except Exception as exc:  # noqa: BLE001
                     run.error = exc
+                    run.messages = list(captured)
+                    run.deps = kwargs.get("deps")
                 else:
                     run.output, run.result = res.output, res
+                    run.messages = res.all_messages()
                     run.deps, run.error = kwargs.get("deps"), None
                     return
 

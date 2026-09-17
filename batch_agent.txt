@@ -42,7 +42,15 @@ except ImportError:  # pragma: no cover — старые версии, исто�
         yield []
 
 
-__all__ = ["Run", "abatch_run", "batch_run", "summary", "print_steps"]
+__all__ = [
+    "Run",
+    "ToolCall",
+    "abatch_run",
+    "batch_run",
+    "summary",
+    "print_steps",
+    "collect_tool_calls",
+]
 
 # part_kind -> человекочитаемое имя шага
 _KIND = {
@@ -61,6 +69,23 @@ _KIND = {
 _PASSTHROUGH = frozenset(
     {"user_prompt", "message_history", "output_type", "model_settings", "deps"}
 )
+
+
+@dataclass
+class ToolCall:
+    """Пара «вызов тула — его результат», собранная из истории прогона."""
+
+    tool: str
+    args: Any = None  # аргументы, которые подала модель
+    result: Any = None  # то, что вернула ваша функция — объект, не строка
+    call_id: Any = None
+    status: str = "no_result"  # ok | failed | retry | no_result
+    error: Any = None  # для retry — детали провалившейся валидации
+    turn: int = 0  # номер обращения к модели
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
 
 
 def _clip(value: Any, limit: int | None) -> Any:
@@ -129,6 +154,50 @@ class Run:
                 out.append(entry)
         return out
 
+    def tool_calls(self, name: str | None = None) -> list[ToolCall]:
+        """Вызовы тулов вместе с результатами. Без усечения, в исходных типах.
+
+        Ретрай из-за невалидных аргументов — отдельная запись со `status="retry"`
+        и деталями в `error`; повторный вызов модели придёт следующей записью.
+        """
+        found: dict[Any, ToolCall] = {}
+        loose: list[ToolCall] = []
+        turn = 0
+
+        def slot(part: Any, cid: Any, tn: str) -> ToolCall:
+            if cid is None:
+                tc = ToolCall(tool=tn, turn=turn)
+                loose.append(tc)
+                return tc
+            return found.setdefault(cid, ToolCall(tool=tn, call_id=cid, turn=turn))
+
+        for msg in self.messages:
+            if type(msg).__name__ == "ModelResponse":
+                turn += 1
+            for part in getattr(msg, "parts", ()):
+                kind = getattr(part, "part_kind", "")
+                cid = getattr(part, "tool_call_id", None)
+                tool_name = getattr(part, "tool_name", None)
+
+                if kind in ("tool-call", "builtin-tool-call"):
+                    tc = slot(part, cid, tool_name or "?")
+                    try:
+                        tc.args = part.args_as_dict()
+                    except Exception:  # noqa: BLE001 — модель прислала не-JSON
+                        tc.args = part.args
+                elif kind in ("tool-return", "builtin-tool-return"):
+                    tc = slot(part, cid, tool_name or "?")
+                    tc.result = part.content
+                    outcome = getattr(part, "outcome", None)
+                    tc.status = "ok" if outcome in (None, "success") else str(outcome)
+                elif kind == "retry-prompt" and tool_name is not None:
+                    tc = slot(part, cid, tool_name)
+                    tc.status = "retry"
+                    tc.error = part.content
+
+        calls = list(found.values()) + loose
+        return [c for c in calls if name is None or c.tool == name]
+
     def messages_json(self) -> str:
         """История в JSON — для чекпойнта или отправки в хранилище."""
         if self.result is not None:
@@ -136,6 +205,18 @@ class Run:
         from pydantic_ai.messages import ModelMessagesTypeAdapter
 
         return ModelMessagesTypeAdapter.dump_json(self.messages).decode()
+
+
+def collect_tool_calls(
+    runs: Sequence[Run], name: str | None = None, *, only_ok: bool = False
+) -> list[tuple[Run, ToolCall]]:
+    """Все вызовы тулов по всему батчу, вместе с прогоном, из которого они."""
+    return [
+        (r, c)
+        for r in runs
+        for c in r.tool_calls(name)
+        if not only_ok or c.ok
+    ]
 
 
 def print_steps(run: Run, *, truncate: int | None = 200) -> None:

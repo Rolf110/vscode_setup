@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
+from traceback import format_exception
 from typing import Any
 
 import httpx
@@ -48,22 +51,36 @@ __all__ = [
     "abatch_run",
     "batch_run",
     "summary",
+    "errors_summary",
     "print_steps",
+    "print_error",
     "collect_tool_calls",
 ]
 
-# part_kind -> человекочитаемое имя шага
-_KIND = {
-    "system-prompt": "system",
-    "user-prompt": "user",
-    "thinking": "thinking",
-    "text": "text",
-    "tool-call": "tool_call",
-    "tool-return": "tool_return",
-    "retry-prompt": "retry",
-    "builtin-tool-call": "builtin_tool_call",
-    "builtin-tool-return": "builtin_tool_return",
-}
+def _classify(part: Any) -> str:
+    """Тип части сообщения. Опознаёт и по part_kind, и по имени класса.
+
+    Дискриминатор `part_kind` есть не во всех версиях pydantic-ai, поэтому
+    полагаться только на него нельзя — иначе вызовы тулов молча теряются.
+    """
+    kind = getattr(part, "part_kind", None) or ""
+    cls = type(part).__name__
+
+    if kind.endswith("tool-call") or cls.endswith("ToolCallPart"):
+        return "tool_call"
+    if kind.endswith("tool-return") or cls.endswith("ToolReturnPart"):
+        return "tool_return"
+    if kind == "retry-prompt" or cls == "RetryPromptPart":
+        return "retry"
+    if kind == "system-prompt" or cls == "SystemPromptPart":
+        return "system"
+    if kind == "user-prompt" or cls == "UserPromptPart":
+        return "user"
+    if kind == "thinking" or cls == "ThinkingPart":
+        return "thinking"
+    if kind == "text" or cls == "TextPart":
+        return "text"
+    return kind or cls
 
 # Ключи элемента, которые можно передать в agent.run(). Всё остальное — ваше.
 _PASSTHROUGH = frozenset(
@@ -88,6 +105,26 @@ class ToolCall:
         return self.status == "ok"
 
 
+def _format_exc(exc: BaseException) -> str:
+    """Полный traceback вместе с цепочкой __cause__ / __context__."""
+    return "".join(format_exception(type(exc), exc, exc.__traceback__))
+
+
+def _brief(exc: BaseException) -> str:
+    """Тип, сообщение и последний кадр стека — обычно этого хватает."""
+    tb, last = exc.__traceback__, None
+    while tb is not None:
+        last, tb = tb, tb.tb_next
+    where = ""
+    if last is not None:
+        frame = last.tb_frame
+        where = (
+            f"  @ {Path(frame.f_code.co_filename).name}:"
+            f"{last.tb_lineno} в {frame.f_code.co_name}()"
+        )
+    return f"{type(exc).__name__}: {exc}{where}"
+
+
 def _clip(value: Any, limit: int | None) -> Any:
     if limit is None or not isinstance(value, str) or len(value) <= limit:
         return value
@@ -101,6 +138,8 @@ class Run:
     index: int
     output: Any = None
     error: BaseException | None = None
+    traceback: str | None = None  # полный стек последней неудачной попытки
+    attempt_errors: list[str] = field(default_factory=list)  # по строке на попытку
     meta: Any = None
     deps: Any = None  # объект deps этого прогона — ваши счётчики из тулов
     result: Any = None  # AgentRunResult; None, если прогон упал
@@ -110,6 +149,11 @@ class Run:
     @property
     def ok(self) -> bool:
         return self.error is None
+
+    @property
+    def error_brief(self) -> str | None:
+        """Тип, сообщение и место падения одной строкой."""
+        return None if self.error is None else _brief(self.error)
 
     def steps(
         self, *, include_system: bool = False, truncate: int | None = 400
@@ -125,23 +169,19 @@ class Run:
             if type(msg).__name__ == "ModelResponse":
                 turn += 1
             for part in getattr(msg, "parts", ()):
-                raw_kind = getattr(part, "part_kind", type(part).__name__)
-                if raw_kind == "system-prompt" and not include_system:
+                kind = _classify(part)
+                if kind == "system" and not include_system:
                     continue
 
-                entry: dict[str, Any] = {
-                    "n": len(out),
-                    "turn": turn,
-                    "kind": _KIND.get(raw_kind, raw_kind),
-                }
-                if raw_kind in ("tool-call", "builtin-tool-call"):
-                    entry["tool"] = part.tool_name
+                entry: dict[str, Any] = {"n": len(out), "turn": turn, "kind": kind}
+                if kind == "tool_call":
+                    entry["tool"] = getattr(part, "tool_name", None)
                     try:
                         entry["args"] = part.args_as_dict()
                     except Exception:  # noqa: BLE001 — модель прислала не-JSON
-                        entry["args"] = part.args
+                        entry["args"] = getattr(part, "args", None)
                     entry["call_id"] = getattr(part, "tool_call_id", None)
-                elif raw_kind in ("tool-return", "retry-prompt", "builtin-tool-return"):
+                elif kind in ("tool_return", "retry"):
                     entry["tool"] = getattr(part, "tool_name", None)
                     entry["content"] = _clip(getattr(part, "content", None), truncate)
                     entry["call_id"] = getattr(part, "tool_call_id", None)
@@ -175,25 +215,30 @@ class Run:
             if type(msg).__name__ == "ModelResponse":
                 turn += 1
             for part in getattr(msg, "parts", ()):
-                kind = getattr(part, "part_kind", "")
+                kind = _classify(part)
+                if kind not in ("tool_call", "tool_return", "retry"):
+                    continue
                 cid = getattr(part, "tool_call_id", None)
                 tool_name = getattr(part, "tool_name", None)
+                if kind == "retry" and tool_name is None:
+                    continue  # ретрай финального ответа, а не тула
 
-                if kind in ("tool-call", "builtin-tool-call"):
-                    tc = slot(part, cid, tool_name or "?")
+                tc = slot(part, cid, tool_name or "?")
+                if tool_name and tc.tool == "?":
+                    tc.tool = tool_name
+
+                if kind == "tool_call":
                     try:
                         tc.args = part.args_as_dict()
                     except Exception:  # noqa: BLE001 — модель прислала не-JSON
-                        tc.args = part.args
-                elif kind in ("tool-return", "builtin-tool-return"):
-                    tc = slot(part, cid, tool_name or "?")
-                    tc.result = part.content
+                        tc.args = getattr(part, "args", None)
+                elif kind == "tool_return":
+                    tc.result = getattr(part, "content", None)
                     outcome = getattr(part, "outcome", None)
                     tc.status = "ok" if outcome in (None, "success") else str(outcome)
-                elif kind == "retry-prompt" and tool_name is not None:
-                    tc = slot(part, cid, tool_name)
+                else:
                     tc.status = "retry"
-                    tc.error = part.content
+                    tc.error = getattr(part, "content", None)
 
         calls = list(found.values()) + loose
         return [c for c in calls if name is None or c.tool == name]
@@ -236,7 +281,31 @@ def print_steps(run: Run, *, truncate: int | None = 200) -> None:
 
 def summary(runs: Sequence[Run]) -> str:
     ok = sum(r.ok for r in runs)
-    return f"ok={ok} failed={len(runs) - ok} из {len(runs)}"
+    line = f"ok={ok} failed={len(runs) - ok} из {len(runs)}"
+    if bad := errors_summary(runs):
+        line += " | " + ", ".join(f"{k}×{v}" for k, v in bad.items())
+    return line
+
+
+def errors_summary(runs: Sequence[Run]) -> dict[str, int]:
+    """Сколько каких исключений по батчу — что чинить в первую очередь."""
+    return dict(
+        Counter(type(r.error).__name__ for r in runs if not r.ok).most_common()
+    )
+
+
+def print_error(run: Run, *, full: bool = True) -> None:
+    """Печатает разбор падения: попытки, место и полный стек."""
+    head = f"#{run.index}" + (f" {run.meta}" if run.meta is not None else "")
+    if run.ok:
+        print(f"=== {head} — без ошибок")
+        return
+    print(f"=== {head} — попыток: {run.attempts}")
+    for line in run.attempt_errors:
+        print(f"  {line}")
+    if full and run.traceback:
+        print()
+        print(run.traceback.rstrip())
 
 
 def _normalize(item: Any) -> dict[str, Any]:
@@ -394,6 +463,7 @@ async def abatch_run(
                 kwargs["model"] = llm
                 kwargs.setdefault("usage_limits", UsageLimits(request_limit=request_limit))
 
+                captured: list[Any] = []
                 try:
                     # Свой контекст на каждую попытку: capture_run_messages ловит
                     # только первый run внутри блока.
@@ -403,20 +473,25 @@ async def abatch_run(
                         )
                 except asyncio.CancelledError:
                     raise
-                except asyncio.TimeoutError:
-                    run.error = TimeoutError(
+                except asyncio.TimeoutError as exc:
+                    err: BaseException = TimeoutError(
                         f"элемент {i}: прогон не уложился в item_timeout={item_timeout}s"
                     )
+                    err.__cause__ = exc
+                    run.error, run.traceback = err, _format_exc(err)
+                    run.attempt_errors.append(f"[{attempt}] {_brief(err)}")
                     run.messages = list(captured)
                     run.deps = kwargs.get("deps")
                 except Exception as exc:  # noqa: BLE001
-                    run.error = exc
+                    run.error, run.traceback = exc, _format_exc(exc)
+                    run.attempt_errors.append(f"[{attempt}] {_brief(exc)}")
                     run.messages = list(captured)
                     run.deps = kwargs.get("deps")
                 else:
                     run.output, run.result = res.output, res
                     run.messages = res.all_messages()
-                    run.deps, run.error = kwargs.get("deps"), None
+                    run.deps = kwargs.get("deps")
+                    run.error, run.traceback = None, None
                     return
 
                 if attempt < attempts:

@@ -1,0 +1,116 @@
+"""
+fake_stream_proxy.py - let Claude Code talk to an Anthropic-compatible API that has no streaming.
+
+Claude Code always sends stream=true. This proxy forwards the request with streaming
+removed, waits for the full JSON response, then replays it as Anthropic SSE events.
+While it waits, it sends SSE comment lines so Claude Code's idle watchdog doesn't
+abort the request.
+
+    pip install fastapi uvicorn httpx
+    UPSTREAM_URL=https://your-api.example.com uvicorn fake_stream_proxy:app --port 8080
+    export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+    claude
+"""
+import asyncio
+import json
+import os
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import Response, StreamingResponse
+
+UPSTREAM = os.environ["UPSTREAM_URL"].rstrip("/")
+HEARTBEAT_S = float(os.environ.get("HEARTBEAT_S", "15"))
+UPSTREAM_TIMEOUT_S = float(os.environ.get("UPSTREAM_TIMEOUT_S", "3600"))  # max wait for the upstream reply
+PASS_HEADERS = {"x-api-key", "authorization", "anthropic-version", "anthropic-beta", "content-type"}
+
+app = FastAPI()
+client = httpx.AsyncClient(timeout=httpx.Timeout(UPSTREAM_TIMEOUT_S, connect=30))
+
+
+def fwd_headers(request: Request) -> dict:
+    return {k: v for k, v in request.headers.items() if k.lower() in PASS_HEADERS}
+
+
+def sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def to_events(msg: dict):
+    """Replay a complete Messages API response as the SSE sequence a streaming call would produce."""
+    start = {**msg, "content": [], "stop_reason": None, "stop_sequence": None}
+    yield sse("message_start", {"type": "message_start", "message": start})
+
+    for i, block in enumerate(msg.get("content", [])):
+        kind = block.get("type")
+        if kind == "text":
+            yield sse("content_block_start", {"type": "content_block_start", "index": i,
+                                              "content_block": {"type": "text", "text": ""}})
+            yield sse("content_block_delta", {"type": "content_block_delta", "index": i,
+                                              "delta": {"type": "text_delta", "text": block["text"]}})
+        elif kind == "tool_use":
+            yield sse("content_block_start", {"type": "content_block_start", "index": i,
+                                              "content_block": {**block, "input": {}}})
+            yield sse("content_block_delta", {"type": "content_block_delta", "index": i,
+                                              "delta": {"type": "input_json_delta",
+                                                        "partial_json": json.dumps(block.get("input", {}))}})
+        elif kind == "thinking":
+            yield sse("content_block_start", {"type": "content_block_start", "index": i,
+                                              "content_block": {"type": "thinking", "thinking": ""}})
+            yield sse("content_block_delta", {"type": "content_block_delta", "index": i,
+                                              "delta": {"type": "thinking_delta", "thinking": block.get("thinking", "")}})
+            if block.get("signature"):
+                yield sse("content_block_delta", {"type": "content_block_delta", "index": i,
+                                                  "delta": {"type": "signature_delta", "signature": block["signature"]}})
+        else:
+            # redacted_thinking and other block types: send the whole block in content_block_start
+            yield sse("content_block_start", {"type": "content_block_start", "index": i, "content_block": block})
+        yield sse("content_block_stop", {"type": "content_block_stop", "index": i})
+
+    yield sse("message_delta", {"type": "message_delta",
+                                "delta": {"stop_reason": msg.get("stop_reason"),
+                                          "stop_sequence": msg.get("stop_sequence")},
+                                "usage": msg.get("usage", {})})
+    yield sse("message_stop", {"type": "message_stop"})
+
+
+@app.post("/v1/messages")
+async def messages(request: Request):
+    body = await request.json()
+    wants_stream = body.pop("stream", False)
+    call = client.post(f"{UPSTREAM}/v1/messages", params=request.query_params,
+                       json=body, headers=fwd_headers(request))
+
+    if not wants_stream:
+        r = await call
+        return Response(r.content, status_code=r.status_code, media_type="application/json")
+
+    task = asyncio.create_task(call)
+
+    async def gen():
+        while not task.done():
+            yield ": keepalive\n\n"  # SSE comment: bytes on the wire, ignored by parsers
+            await asyncio.wait({task}, timeout=HEARTBEAT_S)
+        try:
+            r = task.result()
+            payload = r.json()
+        except Exception as e:
+            yield sse("error", {"type": "error", "error": {"type": "api_error", "message": f"proxy: {e}"}})
+            return
+        if r.status_code != 200:
+            # The HTTP status is already 200 at this point, so report the upstream error as an SSE error event
+            yield sse("error", payload if payload.get("type") == "error"
+                      else {"type": "error", "error": {"type": "api_error", "message": json.dumps(payload)}})
+            return
+        for chunk in to_events(payload):
+            yield chunk
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST"])
+async def passthrough(path: str, request: Request):
+    """Everything else (e.g. /v1/messages/count_tokens, /v1/models) goes straight through."""
+    r = await client.request(request.method, f"{UPSTREAM}/{path}", params=request.query_params,
+                             content=await request.body(), headers=fwd_headers(request))
+    return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))

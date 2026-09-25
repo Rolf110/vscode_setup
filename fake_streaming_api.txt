@@ -8,12 +8,19 @@ abort the request.
 
     pip install fastapi uvicorn httpx
     UPSTREAM_URL=https://your-api.example.com uvicorn fake_stream_proxy:app --port 8080
+
+Optional settings (env): HEARTBEAT_S, UPSTREAM_TIMEOUT_S, MAX_CONCURRENCY (queue instead of
+flooding the upstream), RETRY_STATUSES (default 429,503,529), MAX_RETRY_WAIT_S,
+DROP_FIELDS (default "safeguards"), DUMP_DIR (save requests the upstream rejected).
     export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
     claude
 """
 import asyncio
+import contextlib
 import json
+import logging
 import os
+import time
 
 import httpx
 from fastapi import FastAPI, Request
@@ -21,15 +28,65 @@ from fastapi.responses import Response, StreamingResponse
 
 UPSTREAM = os.environ["UPSTREAM_URL"].rstrip("/")
 HEARTBEAT_S = float(os.environ.get("HEARTBEAT_S", "15"))
-UPSTREAM_TIMEOUT_S = float(os.environ.get("UPSTREAM_TIMEOUT_S", "3600"))  # max wait for the upstream reply
+UPSTREAM_TIMEOUT_S = float(os.environ.get("UPSTREAM_TIMEOUT_S", "3600"))  # total budget per request, incl. queue and retries
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "0"))  # max parallel upstream calls; 0 = unlimited
+RETRY_STATUSES = {int(s) for s in os.environ.get("RETRY_STATUSES", "429,503,529").split(",") if s}
+MAX_RETRY_WAIT_S = float(os.environ.get("MAX_RETRY_WAIT_S", "30"))  # cap for a single backoff pause
+DROP_FIELDS = [f for f in os.environ.get("DROP_FIELDS", "safeguards").split(",") if f]  # body fields the upstream rejects
+DUMP_DIR = os.environ.get("DUMP_DIR")  # if set, requests the upstream rejected are saved here
 PASS_HEADERS = {"x-api-key", "authorization", "anthropic-version", "anthropic-beta", "content-type"}
 
 app = FastAPI()
 client = httpx.AsyncClient(timeout=httpx.Timeout(UPSTREAM_TIMEOUT_S, connect=30))
+slots = asyncio.Semaphore(MAX_CONCURRENCY) if MAX_CONCURRENCY > 0 else None
+log = logging.getLogger("uvicorn.error")
 
 
 def fwd_headers(request: Request) -> dict:
     return {k: v for k, v in request.headers.items() if k.lower() in PASS_HEADERS}
+
+
+def drop_fields(body):
+    if isinstance(body, dict):
+        for f in DROP_FIELDS:
+            body.pop(f, None)
+    return body
+
+
+def report_error(r: httpx.Response, body) -> None:
+    """Log the upstream's error text (a 422 names the offending field) and optionally save the request."""
+    log.warning("upstream %s: %s", r.status_code, r.text[:2000])
+    if DUMP_DIR:
+        os.makedirs(DUMP_DIR, exist_ok=True)
+        path = os.path.join(DUMP_DIR, f"{time.time_ns()}-{r.status_code}.json")
+        with open(path, "w") as f:
+            json.dump({"status": r.status_code, "response": r.text, "request": body}, f, ensure_ascii=False, indent=1)
+        log.warning("rejected request saved to %s", path)
+
+
+def retry_delay(r: httpx.Response, attempt: int) -> float:
+    try:
+        return min(float(r.headers["retry-after"]), MAX_RETRY_WAIT_S)
+    except (KeyError, ValueError):
+        return min(2.0 ** attempt, MAX_RETRY_WAIT_S)  # 2, 4, 8, ... seconds
+
+
+async def call_upstream(request: Request, body: dict) -> httpx.Response:
+    """POST to the upstream, waiting for a free slot and retrying 429/503/529 with backoff.
+    Callers bound the total time with UPSTREAM_TIMEOUT_S."""
+    attempt = 0
+    while True:
+        async with (slots or contextlib.nullcontext()):
+            r = await client.post(f"{UPSTREAM}/v1/messages", params=request.query_params,
+                                  json=body, headers=fwd_headers(request))
+        if r.status_code not in RETRY_STATUSES:
+            if r.status_code >= 400:
+                report_error(r, body)
+            return r
+        attempt += 1
+        delay = retry_delay(r, attempt)
+        log.warning("upstream %s, retry %d in %.1fs", r.status_code, attempt, delay)
+        await asyncio.sleep(delay)
 
 
 def sse(event: str, data: dict) -> str:
@@ -78,24 +135,32 @@ def to_events(msg: dict):
 async def messages(request: Request):
     body = await request.json()
     wants_stream = body.pop("stream", False)
-    call = client.post(f"{UPSTREAM}/v1/messages", params=request.query_params,
-                       json=body, headers=fwd_headers(request))
+    drop_fields(body)
+    call = asyncio.wait_for(call_upstream(request, body), UPSTREAM_TIMEOUT_S)
+    timeout_msg = f"proxy: upstream gave no successful reply within {UPSTREAM_TIMEOUT_S:.0f}s"
 
     if not wants_stream:
-        r = await call
+        try:
+            r = await call
+        except asyncio.TimeoutError:
+            return Response(json.dumps({"type": "error", "error": {"type": "timeout_error", "message": timeout_msg}}),
+                            status_code=504, media_type="application/json")
         return Response(r.content, status_code=r.status_code, media_type="application/json")
 
     task = asyncio.create_task(call)
 
-    async def gen():
+    async def events():
         while not task.done():
             yield ": keepalive\n\n"  # SSE comment: bytes on the wire, ignored by parsers
             await asyncio.wait({task}, timeout=HEARTBEAT_S)
         try:
             r = task.result()
             payload = r.json()
+        except asyncio.TimeoutError:
+            yield sse("error", {"type": "error", "error": {"type": "timeout_error", "message": timeout_msg}})
+            return
         except Exception as e:
-            yield sse("error", {"type": "error", "error": {"type": "api_error", "message": f"proxy: {e}"}})
+            yield sse("error", {"type": "error", "error": {"type": "api_error", "message": f"proxy: {e!r}"}})
             return
         if r.status_code != 200:
             # The HTTP status is already 200 at this point, so report the upstream error as an SSE error event
@@ -105,12 +170,27 @@ async def messages(request: Request):
         for chunk in to_events(payload):
             yield chunk
 
+    async def gen():
+        try:
+            async for chunk in events():
+                yield chunk
+        finally:
+            task.cancel()  # client went away: stop waiting and free the queue slot
+
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def passthrough(path: str, request: Request):
     """Everything else (e.g. /v1/messages/count_tokens, /v1/models) goes straight through."""
+    raw = await request.body()
+    if raw and DROP_FIELDS and "json" in request.headers.get("content-type", ""):
+        try:
+            raw = json.dumps(drop_fields(json.loads(raw))).encode()
+        except ValueError:
+            pass
     r = await client.request(request.method, f"{UPSTREAM}/{path}", params=request.query_params,
-                             content=await request.body(), headers=fwd_headers(request))
+                             content=raw, headers=fwd_headers(request))
+    if r.status_code >= 400:
+        report_error(r, None)
     return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))

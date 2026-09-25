@@ -1,0 +1,541 @@
+"""
+Простой батчевый прогон Pydantic AI агента против vLLM. Без дедлоков.
+
+Главное правило, из-за нарушения которого всё и висло: httpx-клиент и модель
+создаются ВНУТРИ вызова, в том же event loop, где идёт работа. Ничего не
+переживает вызов, ничего не привязывается к чужому циклу.
+
+В Jupyter:   runs = await abatch_run(agent, items, model=..., deps_factory=...)
+В скрипте:   runs = batch_run(agent, items, model=..., deps_factory=...)
+
+    pip install pydantic-ai httpx tqdm
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+from traceback import format_exception
+from typing import Any
+
+import httpx
+from tqdm.auto import tqdm
+
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.vllm import VLLMProvider
+
+try:
+    from pydantic_ai import UsageLimits
+except ImportError:  # pragma: no cover
+    from pydantic_ai.usage import UsageLimits
+
+try:
+    from pydantic_ai import capture_run_messages
+except ImportError:  # pragma: no cover — старые версии, историю упавших не соберём
+    from contextlib import contextmanager
+
+    @contextmanager
+    def capture_run_messages():  # type: ignore[misc]
+        yield []
+
+
+__all__ = [
+    "Run",
+    "ToolCall",
+    "abatch_run",
+    "batch_run",
+    "summary",
+    "errors_summary",
+    "print_steps",
+    "print_error",
+    "collect_tool_calls",
+]
+
+def _classify(part: Any) -> str:
+    """Тип части сообщения. Опознаёт и по part_kind, и по имени класса.
+
+    Дискриминатор `part_kind` есть не во всех версиях pydantic-ai, поэтому
+    полагаться только на него нельзя — иначе вызовы тулов молча теряются.
+    """
+    kind = getattr(part, "part_kind", None) or ""
+    cls = type(part).__name__
+
+    if kind.endswith("tool-call") or cls.endswith("ToolCallPart"):
+        return "tool_call"
+    if kind.endswith("tool-return") or cls.endswith("ToolReturnPart"):
+        return "tool_return"
+    if kind == "retry-prompt" or cls == "RetryPromptPart":
+        return "retry"
+    if kind == "system-prompt" or cls == "SystemPromptPart":
+        return "system"
+    if kind == "user-prompt" or cls == "UserPromptPart":
+        return "user"
+    if kind == "thinking" or cls == "ThinkingPart":
+        return "thinking"
+    if kind == "text" or cls == "TextPart":
+        return "text"
+    return kind or cls
+
+# Ключи элемента, которые можно передать в agent.run(). Всё остальное — ваше.
+_PASSTHROUGH = frozenset(
+    {"user_prompt", "message_history", "output_type", "model_settings", "deps"}
+)
+
+
+@dataclass
+class ToolCall:
+    """Пара «вызов тула — его результат», собранная из истории прогона."""
+
+    tool: str
+    args: Any = None  # аргументы, которые подала модель
+    result: Any = None  # то, что вернула ваша функция — объект, не строка
+    metadata: Any = None  # ToolReturn.metadata — к модели не уходит
+    timestamp: Any = None  # когда результат лёг в историю
+    call_id: Any = None
+    status: str = "no_result"  # ok | failed | retry | no_result
+    error: Any = None  # для retry — детали провалившейся валидации
+    turn: int = 0  # номер обращения к модели
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+
+def _format_exc(exc: BaseException) -> str:
+    """Полный traceback вместе с цепочкой __cause__ / __context__."""
+    return "".join(format_exception(type(exc), exc, exc.__traceback__))
+
+
+def _brief(exc: BaseException) -> str:
+    """Тип, сообщение и последний кадр стека — обычно этого хватает."""
+    tb, last = exc.__traceback__, None
+    while tb is not None:
+        last, tb = tb, tb.tb_next
+    where = ""
+    if last is not None:
+        frame = last.tb_frame
+        where = (
+            f"  @ {Path(frame.f_code.co_filename).name}:"
+            f"{last.tb_lineno} в {frame.f_code.co_name}()"
+        )
+    return f"{type(exc).__name__}: {exc}{where}"
+
+
+def _clip(value: Any, limit: int | None) -> Any:
+    if limit is None or not isinstance(value, str) or len(value) <= limit:
+        return value
+    return value[:limit] + f"… (+{len(value) - limit} симв.)"
+
+
+@dataclass
+class Run:
+    """Результат одного элемента. Проверяйте `.ok`, а не isinstance."""
+
+    index: int
+    output: Any = None
+    error: BaseException | None = None
+    traceback: str | None = None  # полный стек последней неудачной попытки
+    attempt_errors: list[str] = field(default_factory=list)  # по строке на попытку
+    meta: Any = None
+    deps: Any = None  # объект deps этого прогона — ваши счётчики из тулов
+    result: Any = None  # AgentRunResult; None, если прогон упал
+    messages: list[Any] = field(default_factory=list)  # история, в т.ч. у упавших
+    attempts: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+    @property
+    def error_brief(self) -> str | None:
+        """Тип, сообщение и место падения одной строкой."""
+        return None if self.error is None else _brief(self.error)
+
+    def steps(
+        self, *, include_system: bool = False, truncate: int | None = 400
+    ) -> list[dict[str, Any]]:
+        """Плоская лента: что агент думал, что вызвал, с чем и что получил.
+
+        `turn` — номер обращения к модели, по нему видно, сколько было
+        round-trip'ов. Порядок шагов — хронологический.
+        """
+        out: list[dict[str, Any]] = []
+        turn = 0
+        for msg in self.messages:
+            if type(msg).__name__ == "ModelResponse":
+                turn += 1
+            for part in getattr(msg, "parts", ()):
+                kind = _classify(part)
+                if kind == "system" and not include_system:
+                    continue
+
+                entry: dict[str, Any] = {"n": len(out), "turn": turn, "kind": kind}
+                if kind == "tool_call":
+                    entry["tool"] = getattr(part, "tool_name", None)
+                    try:
+                        entry["args"] = part.args_as_dict()
+                    except Exception:  # noqa: BLE001 — модель прислала не-JSON
+                        entry["args"] = getattr(part, "args", None)
+                    entry["call_id"] = getattr(part, "tool_call_id", None)
+                elif kind in ("tool_return", "retry"):
+                    entry["tool"] = getattr(part, "tool_name", None)
+                    entry["content"] = _clip(getattr(part, "content", None), truncate)
+                    entry["call_id"] = getattr(part, "tool_call_id", None)
+                    if (md := getattr(part, "metadata", None)) is not None:
+                        entry["metadata"] = md
+                    if outcome := getattr(part, "outcome", None):
+                        entry["outcome"] = outcome
+                elif hasattr(part, "content"):
+                    entry["content"] = _clip(part.content, truncate)
+                else:
+                    entry["repr"] = _clip(str(part), truncate)
+                out.append(entry)
+        return out
+
+    def tool_calls(self, name: str | None = None) -> list[ToolCall]:
+        """Вызовы тулов вместе с результатами. Без усечения, в исходных типах.
+
+        Ретрай из-за невалидных аргументов — отдельная запись со `status="retry"`
+        и деталями в `error`; повторный вызов модели придёт следующей записью.
+        """
+        found: dict[Any, ToolCall] = {}
+        loose: list[ToolCall] = []
+        turn = 0
+
+        def slot(part: Any, cid: Any, tn: str) -> ToolCall:
+            if cid is None:
+                tc = ToolCall(tool=tn, turn=turn)
+                loose.append(tc)
+                return tc
+            return found.setdefault(cid, ToolCall(tool=tn, call_id=cid, turn=turn))
+
+        for msg in self.messages:
+            if type(msg).__name__ == "ModelResponse":
+                turn += 1
+            for part in getattr(msg, "parts", ()):
+                kind = _classify(part)
+                if kind not in ("tool_call", "tool_return", "retry"):
+                    continue
+                cid = getattr(part, "tool_call_id", None)
+                tool_name = getattr(part, "tool_name", None)
+                if kind == "retry" and tool_name is None:
+                    continue  # ретрай финального ответа, а не тула
+
+                tc = slot(part, cid, tool_name or "?")
+                if tool_name and tc.tool == "?":
+                    tc.tool = tool_name
+
+                if kind == "tool_call":
+                    try:
+                        tc.args = part.args_as_dict()
+                    except Exception:  # noqa: BLE001 — модель прислала не-JSON
+                        tc.args = getattr(part, "args", None)
+                elif kind == "tool_return":
+                    tc.result = getattr(part, "content", None)
+                    tc.metadata = getattr(part, "metadata", None)
+                    tc.timestamp = getattr(part, "timestamp", None)
+                    outcome = getattr(part, "outcome", None)
+                    tc.status = "ok" if outcome in (None, "success") else str(outcome)
+                else:
+                    tc.status = "retry"
+                    tc.error = getattr(part, "content", None)
+
+        calls = list(found.values()) + loose
+        return [c for c in calls if name is None or c.tool == name]
+
+    def messages_json(self) -> str:
+        """История в JSON — для чекпойнта или отправки в хранилище."""
+        if self.result is not None:
+            return self.result.all_messages_json().decode()
+        from pydantic_ai.messages import ModelMessagesTypeAdapter
+
+        return ModelMessagesTypeAdapter.dump_json(self.messages).decode()
+
+
+def collect_tool_calls(
+    runs: Sequence[Run], name: str | None = None, *, only_ok: bool = False
+) -> list[tuple[Run, ToolCall]]:
+    """Все вызовы тулов по всему батчу, вместе с прогоном, из которого они."""
+    return [
+        (r, c)
+        for r in runs
+        for c in r.tool_calls(name)
+        if not only_ok or c.ok
+    ]
+
+
+def print_steps(run: Run, *, truncate: int | None = 200) -> None:
+    """Печатает ленту шагов одного прогона в читаемом виде."""
+    head = f"#{run.index}" + (f" {run.meta}" if run.meta is not None else "")
+    print(f"=== {head} — {'ok' if run.ok else f'FAILED: {run.error!r}'}")
+    for s in run.steps(truncate=truncate):
+        prefix = f"  [{s['turn']}] {s['kind']:<18}"
+        if s["kind"] in ("tool_call", "builtin_tool_call"):
+            print(f"{prefix} {s['tool']}({s.get('args')})")
+        elif "tool" in s:
+            mark = f" [{s['outcome']}]" if "outcome" in s else ""
+            print(f"{prefix} {s['tool']}{mark} -> {s.get('content')}")
+        else:
+            print(f"{prefix} {s.get('content', s.get('repr'))}")
+
+
+def summary(runs: Sequence[Run]) -> str:
+    ok = sum(r.ok for r in runs)
+    line = f"ok={ok} failed={len(runs) - ok} из {len(runs)}"
+    if bad := errors_summary(runs):
+        line += " | " + ", ".join(f"{k}×{v}" for k, v in bad.items())
+    return line
+
+
+def errors_summary(runs: Sequence[Run]) -> dict[str, int]:
+    """Сколько каких исключений по батчу — что чинить в первую очередь."""
+    return dict(
+        Counter(type(r.error).__name__ for r in runs if not r.ok).most_common()
+    )
+
+
+def print_error(run: Run, *, full: bool = True) -> None:
+    """Печатает разбор падения: попытки, место и полный стек."""
+    head = f"#{run.index}" + (f" {run.meta}" if run.meta is not None else "")
+    if run.ok:
+        print(f"=== {head} — без ошибок")
+        return
+    print(f"=== {head} — попыток: {run.attempts}")
+    for line in run.attempt_errors:
+        print(f"  {line}")
+    if full and run.traceback:
+        print()
+        print(run.traceback.rstrip())
+
+
+def _normalize(item: Any) -> dict[str, Any]:
+    if isinstance(item, str):
+        return {"user_prompt": item}
+    if isinstance(item, Mapping):
+        d = dict(item)
+        if "user_prompt" not in d:
+            raise ValueError(f"в элементе нет 'user_prompt': {d!r}")
+        return d
+    raise TypeError(f"элемент должен быть str или Mapping, получен {type(item).__name__}")
+
+
+async def _preflight(http: httpx.AsyncClient, base_url: str, model: str, api_key: str,
+                     timeout: float) -> None:
+    """Быстрая проверка, что эндпоинт жив и модель на нём есть."""
+    url = base_url.rstrip("/") + "/models"
+    try:
+        resp = await http.get(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=httpx.Timeout(timeout, connect=timeout),
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Эндпоинт {base_url} не отвечает ({type(exc).__name__}: {exc}). "
+            "Батч не запущен — проверьте, что vLLM поднят на этом адресе."
+        ) from exc
+
+    served = [m.get("id") for m in resp.json().get("data", [])]
+    if model not in served:
+        raise RuntimeError(
+            f"Модель {model!r} не найдена на {base_url}. Доступны: {served}. "
+            "Возьмите имя из этого списка или задайте --served-model-name."
+        )
+
+
+def _make_debug_hook(budget: dict[str, int]) -> Callable:
+    async def hook(request: httpx.Request) -> None:
+        if budget["left"] <= 0 or not request.url.path.endswith("/chat/completions"):
+            return
+        budget["left"] -= 1
+        body = json.loads(request.content)
+        print(
+            json.dumps(
+                {
+                    "messages": body.get("messages"),
+                    "tools": body.get("tools"),
+                    "tool_choice": body.get("tool_choice"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
+    return hook
+
+
+async def abatch_run(
+    agent: Agent,
+    items: Sequence[Any],
+    *,
+    model: str,
+    base_url: str = "http://localhost:8000/v1",
+    api_key: str = "EMPTY",
+    concurrency: int = 32,
+    deps_factory: Callable[[Mapping[str, Any]], Any] | None = None,
+    request_limit: int = 6,
+    attempts: int = 2,
+    http_timeout: float = 180.0,
+    item_timeout: float = 600.0,
+    connect_timeout: float = 5.0,
+    preflight: bool = True,
+    progress: bool = True,
+    debug_requests: int = 0,
+    run_kwargs: Mapping[str, Any] | None = None,
+) -> list[Run]:
+    """Прогоняет агента по списку элементов. Возвращает список `Run` по порядку.
+
+    Args:
+        agent: `Agent` с зарегистрированными тулами. Модель ему не нужна —
+            она собирается здесь и подставляется в каждый прогон.
+        items: Список строк-промптов, либо словарей с `user_prompt` и, по
+            желанию, `meta` / `deps` / `message_history` / `output_type` /
+            `model_settings`. Ключ `meta` в `agent.run()` не уходит.
+        model: Имя модели, как его отдаёт `/v1/models`.
+        concurrency: Сколько элементов обрабатывать одновременно. Воркер занят
+            весь прогон (модель → тул → модель), а на GPU в каждый момент идёт
+            максимум один его запрос — так что ставьте выше, чем для голых
+            completions.
+        deps_factory: Как построить `deps` из элемента; вызывается заново на
+            каждую попытку, чтобы мутабельное состояние не текло между ними.
+        request_limit: Потолок запросов к модели на один прогон.
+        attempts: Повторов прогона при исключении или таймауте.
+        http_timeout: Таймаут одного HTTP-запроса.
+        item_timeout: Таймаут всего прогона элемента, включая тулы и ретраи
+            внутри pydantic-ai. Жёсткий: по нему элемент снимается.
+        connect_timeout: Таймаут установки соединения. Маленький намеренно —
+            мёртвый порт должен давать ошибку за секунды, а не висеть.
+        preflight: Проверить доступность эндпоинта и наличие модели до старта.
+        debug_requests: Напечатать тела первых N запросов к /chat/completions.
+        run_kwargs: Общие kwargs, добавляемые в каждый `agent.run()`.
+
+    Returns:
+        Список `Run` той же длины и в том же порядке, что `items`. Ошибки
+        лежат в `Run.error`, а не подменяют тип элемента.
+
+        В `Run.messages` — полная история прогона в формате pydantic-ai, в том
+        числе у упавших элементов (собирается через `capture_run_messages`).
+        `Run.steps()` разворачивает её в плоскую хронологическую ленту:
+        размышления, вызовы тулов с аргументами, их результаты, ретраи и
+        финальный текст. `print_steps(run)` печатает то же читаемо.
+    """
+    norm = [_normalize(it) for it in items]
+    if not norm:
+        return []
+
+    runs = [Run(index=i, meta=it.get("meta")) for i, it in enumerate(norm)]
+
+    hooks: dict[str, list] = {}
+    if debug_requests > 0:
+        hooks["request"] = [_make_debug_hook({"left": debug_requests})]
+
+    # Всё внутри: клиент живёт ровно столько, сколько этот вызов.
+    async with httpx.AsyncClient(
+        limits=httpx.Limits(
+            max_connections=concurrency, max_keepalive_connections=concurrency
+        ),
+        timeout=httpx.Timeout(http_timeout, connect=connect_timeout),
+        event_hooks=hooks,
+    ) as http:
+        if preflight:
+            await _preflight(http, base_url, model, api_key, connect_timeout)
+
+        llm = OpenAIChatModel(
+            model,
+            provider=VLLMProvider(base_url=base_url, api_key=api_key, http_client=http),
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        for i in range(len(norm)):
+            queue.put_nowait(i)
+        bar = tqdm(total=len(norm), disable=not progress, desc="agent")
+
+        async def one(i: int) -> None:
+            item, run = norm[i], runs[i]
+            for attempt in range(1, attempts + 1):
+                run.attempts = attempt
+
+                kwargs: dict[str, Any] = dict(run_kwargs or {})
+                kwargs.update({k: v for k, v in item.items() if k in _PASSTHROUGH})
+                if "deps" not in kwargs and deps_factory is not None:
+                    kwargs["deps"] = deps_factory(item)
+                kwargs["model"] = llm
+                kwargs.setdefault("usage_limits", UsageLimits(request_limit=request_limit))
+
+                captured: list[Any] = []
+                try:
+                    # Свой контекст на каждую попытку: capture_run_messages ловит
+                    # только первый run внутри блока.
+                    with capture_run_messages() as captured:
+                        res = await asyncio.wait_for(
+                            agent.run(**kwargs), timeout=item_timeout
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError as exc:
+                    err: BaseException = TimeoutError(
+                        f"элемент {i}: прогон не уложился в item_timeout={item_timeout}s"
+                    )
+                    err.__cause__ = exc
+                    run.error, run.traceback = err, _format_exc(err)
+                    run.attempt_errors.append(f"[{attempt}] {_brief(err)}")
+                    run.messages = list(captured)
+                    run.deps = kwargs.get("deps")
+                except Exception as exc:  # noqa: BLE001
+                    run.error, run.traceback = exc, _format_exc(exc)
+                    run.attempt_errors.append(f"[{attempt}] {_brief(exc)}")
+                    run.messages = list(captured)
+                    run.deps = kwargs.get("deps")
+                else:
+                    run.output, run.result = res.output, res
+                    run.messages = res.all_messages()
+                    run.deps = kwargs.get("deps")
+                    run.error, run.traceback = None, None
+                    return
+
+                if attempt < attempts:
+                    await asyncio.sleep(2**attempt)
+
+        async def worker() -> None:
+            while True:
+                try:
+                    i = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                await one(i)
+                bar.update(1)
+
+        try:
+            await asyncio.gather(
+                *(
+                    asyncio.create_task(worker())
+                    for _ in range(min(concurrency, len(norm)))
+                )
+            )
+        finally:
+            bar.close()
+
+    return runs
+
+
+def batch_run(agent: Agent, items: Sequence[Any], **kwargs: Any) -> list[Run]:
+    """Синхронная обёртка. В Jupyter лучше `await abatch_run(...)` напрямую.
+
+    Безопасна и при уже работающем цикле: корутина уходит в отдельный поток со
+    своим циклом, а httpx-клиент создаётся внутри неё, так что привязки к чужому
+    циклу не возникает.
+    """
+    coro_factory = lambda: abatch_run(agent, items, **kwargs)  # noqa: E731
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro_factory())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(coro_factory())).result()

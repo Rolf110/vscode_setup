@@ -1,0 +1,449 @@
+"""
+Общий судья агентских прогонов: адаптер -> канонический трейс -> фиксированный судья.
+
+Принцип: судья не знает предметную область. Домен он получает из схем тулов,
+которые реально ушли модели. Поэтому при смене бенчмарка меняется адаптер
+(`to_trace`), а инструкции и выходная схема судьи остаются те же.
+
+Всё, что считается кодом, считается кодом и кладётся в контекст готовым —
+судья не пересчитывает, а опирается.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Iterable, Sequence
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+__all__ = [
+    "ToolSpec",
+    "TraceStep",
+    "Trace",
+    "Judgement",
+    "collect_tool_specs",
+    "catalog_hook",
+    "unify_catalogs",
+    "mark_filtered",
+    "capture_tool_catalog",
+    "deterministic_metrics",
+    "to_trace",
+    "render_trace",
+    "JUDGE_INSTRUCTIONS",
+]
+
+_NUM = re.compile(r"-?\d+(?:[.,]\d+)?")
+_MAX_FIELD = 1200  # потолок на один результат тула в контексте судьи
+
+
+# --------------------------------------------------------------------------
+# Канонический трейс — то, во что адаптируется любой агент
+# --------------------------------------------------------------------------
+class ToolSpec(BaseModel):
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = None  # JSON Schema как её видела модель
+    kind: str | None = None  # function | output | external — если фреймворк различает
+    source: str | None = None  # какой toolset предоставил
+    available: bool = True  # False — тул существует, но prepare убрал его в этом прогоне
+
+
+class TraceStep(BaseModel):
+    i: int  # номер шага; судья ссылается именно на него
+    turn: int  # номер обращения к модели
+    kind: str  # thinking | tool_call | tool_return | retry | text
+    tool: str | None = None
+    args: Any = None
+    content: Any = None  # результат тула или текст
+    status: str | None = None  # ok | failed | retry | no_result
+    truncated: bool = False
+
+
+class Trace(BaseModel):
+    """Единица оценки. Один прогон агента, приведённый к общему виду."""
+
+    task: str
+    history: list[str] = Field(default_factory=list)  # предыдущие ходы, кратко
+    tools: list[ToolSpec] = Field(default_factory=list)
+    steps: list[TraceStep] = Field(default_factory=list)
+    answer: Any = None
+    failed: bool = False
+    error: str | None = None
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    constraints: str | None = None  # инструкции агента, если оцениваем их соблюдение
+    reference: str | None = None  # эталон, если бенчмарк его даёт
+
+
+# --------------------------------------------------------------------------
+# Каталог тулов: берём то, что реально ушло модели
+# --------------------------------------------------------------------------
+async def collect_tool_specs(agent: Any, ctx: Any) -> list[ToolSpec]:
+    """Каталог тулов, доступных агенту В ЭТОМ прогоне, из `agent.toolsets`.
+
+    `get_tools(ctx)` асинхронный и требует живого RunContext не случайно: с
+    `prepare`-функциями набор вычисляется на каждый прогон. Статический дамп
+    соврал бы ровно там, где это важнее всего.
+
+    Зовите из места, где RunContext уже есть — проще всего из `@agent.instructions`
+    (см. `catalog_hook`): они выполняются перед каждым запросом к модели, поэтому
+    каталог снимается и для прогонов, где тул так и не был вызван. Это как раз
+    случай, который судье нужнее прочих.
+    """
+    toolsets = getattr(agent, "toolsets", None)
+    if not toolsets:
+        return []
+
+    specs: dict[str, ToolSpec] = {}
+    for toolset in toolsets:
+        try:
+            tools = await toolset.get_tools(ctx)
+        except Exception:  # noqa: BLE001 — один сломанный toolset не рушит сбор
+            continue
+        for name, tool in (tools or {}).items():
+            td = getattr(tool, "tool_def", tool)
+            kind = getattr(td, "kind", None)
+            specs[name] = ToolSpec(
+                name=getattr(td, "name", name),
+                description=getattr(td, "description", None),
+                parameters=getattr(td, "parameters_json_schema", None)
+                or getattr(td, "parameters", None),
+                kind=str(kind) if kind is not None else None,
+                source=type(toolset).__name__,
+            )
+    return sorted(specs.values(), key=lambda s: s.name)
+
+
+def catalog_hook(agent: Any, attr: str = "tools") -> Any:
+    """Готовый `@agent.instructions`-хук: кладёт каталог в deps один раз за прогон.
+
+        @dataclass
+        class Deps:
+            df: pd.DataFrame
+            tools: list[ToolSpec] = field(default_factory=list)
+
+        agent.instructions(catalog_hook(agent))
+
+    Инструкций не добавляет — возвращает пустую строку.
+    """
+
+    async def hook(ctx: Any) -> str:
+        store = getattr(ctx.deps, attr, None)
+        if store is not None and not store:
+            store.extend(await collect_tool_specs(agent, ctx))
+        return ""
+
+    return hook
+
+
+def unify_catalogs(traces: Sequence[Trace]) -> list[ToolSpec]:
+    """Объединение каталогов по батчу — практический аналог «всех тулов агента»."""
+    merged: dict[str, ToolSpec] = {}
+    for tr in traces:
+        for spec in tr.tools:
+            merged.setdefault(spec.name, spec)
+    return sorted(merged.values(), key=lambda s: s.name)
+
+
+def mark_filtered(traces: Sequence[Trace]) -> None:
+    """Дописывает в каждый трейс тулы, которых в этом прогоне не было.
+
+    Так судья видит и то, из чего агент выбирал, и то, что `prepare` убрал.
+    Выбор оценивается среди доступного, а недостающий тул объясняет провал,
+    в котором агент не виноват.
+    """
+    full = {s.name: s for s in unify_catalogs(traces)}
+    for tr in traces:
+        present = {s.name for s in tr.tools}
+        for name, spec in full.items():
+            if name not in present:
+                tr.tools.append(spec.model_copy(update={"available": False}))
+        tr.tools.sort(key=lambda s: (not s.available, s.name))
+
+
+def capture_tool_catalog(sink: dict[str, Any]) -> Any:
+    """Хук для httpx: кладёт в `sink["tools"]` схемы из первого запроса.
+
+        sink: dict = {}
+        http = httpx.AsyncClient(event_hooks={"request": [capture_tool_catalog(sink)]})
+
+    Framework-agnostic: это ровно тот контракт, который видела модель,
+    без расхождений с тем, что зарегистрировано на агенте.
+    """
+
+    async def hook(request: Any) -> None:
+        if "tools" in sink or not str(request.url).endswith("/chat/completions"):
+            return
+        try:
+            body = json.loads(request.content)
+        except Exception:  # noqa: BLE001
+            return
+        specs = []
+        for t in body.get("tools") or []:
+            fn = t.get("function", t)
+            specs.append(
+                ToolSpec(
+                    name=fn.get("name", "?"),
+                    description=fn.get("description"),
+                    parameters=fn.get("parameters"),
+                )
+            )
+        if specs:
+            sink["tools"] = specs
+
+    return hook
+
+
+# --------------------------------------------------------------------------
+# Детерминированные проверки — без LLM
+# --------------------------------------------------------------------------
+def _numbers(value: Any) -> set[str]:
+    text = value if isinstance(value, str) else json.dumps(
+        value, ensure_ascii=False, default=str
+    )
+    return {n.replace(",", ".") for n in _NUM.findall(text)}
+
+
+def deterministic_metrics(run: Any) -> dict[str, Any]:
+    """Всё, что можно посчитать точно. Судья это получает готовым."""
+    calls = run.tool_calls()
+    ok_calls = [c for c in calls if c.ok]
+
+    seen: set[str] = set()
+    duplicates = 0
+    for c in ok_calls:
+        sig = f"{c.tool}:{json.dumps(c.args, sort_keys=True, ensure_ascii=False, default=str)}"
+        if sig in seen:
+            duplicates += 1
+        seen.add(sig)
+
+    grounded = _numbers([c.result for c in ok_calls])
+    answer_nums = _numbers(run.output) if run.output is not None else set()
+
+    return {
+        "tool_calls": len(calls),
+        "tool_calls_ok": len(ok_calls),
+        "tools_used": sorted({c.tool for c in ok_calls}),
+        "model_turns": max((c.turn for c in calls), default=0),
+        "arg_validation_retries": sum(c.status == "retry" for c in calls),
+        "failed_calls": sum(c.status == "failed" for c in calls),
+        "duplicate_calls": duplicates,
+        "attempts": getattr(run, "attempts", 1),
+        "run_failed": not run.ok,
+        # числа в ответе, которых нет ни в одном результате тула
+        "ungrounded_numbers": sorted(answer_nums - grounded) if ok_calls else [],
+    }
+
+
+# --------------------------------------------------------------------------
+# Адаптер: Run -> Trace. Под новый фреймворк переписывается только он.
+# --------------------------------------------------------------------------
+def _trim(value: Any, limit: int = _MAX_FIELD) -> tuple[Any, bool]:
+    text = value if isinstance(value, str) else json.dumps(
+        value, ensure_ascii=False, default=str
+    )
+    if len(text) <= limit:
+        return value, False
+    return text[:limit] + " …[обрезано]", True
+
+
+def to_trace(
+    run: Any,
+    *,
+    task: str,
+    tools: Sequence[ToolSpec] = (),
+    history: Iterable[str] = (),
+    constraints: str | None = None,
+    reference: str | None = None,
+) -> Trace:
+    """Приводит `simple_batch.Run` к каноническому трейсу."""
+    steps: list[TraceStep] = []
+    for s in run.steps(include_system=False, truncate=None):
+        if s["kind"] == "system":
+            continue
+        content, cut = _trim(s.get("content"))
+        steps.append(
+            TraceStep(
+                i=len(steps),
+                turn=s.get("turn", 0),
+                kind=s["kind"],
+                tool=s.get("tool"),
+                args=s.get("args"),
+                content=content,
+                status=s.get("outcome"),
+                truncated=cut,
+            )
+        )
+
+    answer, _ = _trim(run.output, limit=4000)
+    return Trace(
+        task=task,
+        history=list(history),
+        tools=list(tools),
+        steps=steps,
+        answer=answer,
+        failed=not run.ok,
+        error=run.error_brief if not run.ok else None,
+        metrics=deterministic_metrics(run),
+        constraints=constraints,
+        reference=reference,
+    )
+
+
+def render_trace(trace: Trace) -> str:
+    """Блок, который уходит судье. Порядок блоков фиксирован."""
+    out: list[str] = []
+
+    out.append("## ЗАДАЧА\n" + trace.task)
+    if trace.history:
+        out.append("## ПРЕДЫДУЩИЕ ХОДЫ\n" + "\n".join(f"- {h}" for h in trace.history))
+
+    available = [t for t in trace.tools if t.available]
+    filtered = [t for t in trace.tools if not t.available]
+
+    if available:
+        lines = []
+        for t in available:
+            lines.append(f"### {t.name}\n{t.description or '(без описания)'}")
+            if t.parameters:
+                lines.append(
+                    "Схема аргументов:\n```json\n"
+                    + json.dumps(t.parameters, ensure_ascii=False, indent=2)
+                    + "\n```"
+                )
+        out.append(
+            "## ИНСТРУМЕНТЫ, ДОСТУПНЫЕ В ЭТОМ ПРОГОНЕ\n"
+            "(полный набор, из которого агент выбирал)\n\n" + "\n".join(lines)
+        )
+
+    if filtered:
+        out.append(
+            "## ИНСТРУМЕНТЫ, НЕДОСТУПНЫЕ В ЭТОМ ПРОГОНЕ\n"
+            "(существуют у агента, но были отфильтрованы и модели не отправлялись — "
+            "ставить в вину их неиспользование нельзя)\n"
+            + "\n".join(f"- {t.name}: {t.description or '(без описания)'}" for t in filtered)
+        )
+
+    rows = []
+    for s in trace.steps:
+        head = f"[{s.i}] (обращение {s.turn}) {s.kind}"
+        if s.kind == "tool_call":
+            rows.append(f"{head}: {s.tool}({json.dumps(s.args, ensure_ascii=False)})")
+        elif s.tool:
+            mark = f" [{s.status}]" if s.status else ""
+            rows.append(
+                f"{head}: {s.tool}{mark} -> "
+                f"{json.dumps(s.content, ensure_ascii=False, default=str)}"
+            )
+        else:
+            rows.append(f"{head}: {s.content}")
+    out.append("## ТРАЕКТОРИЯ\n" + ("\n".join(rows) if rows else "(пусто)"))
+
+    out.append(
+        "## ОТВЕТ АГЕНТА\n"
+        + (json.dumps(trace.answer, ensure_ascii=False, default=str)
+           if not isinstance(trace.answer, str) else trace.answer)
+    )
+    if trace.failed:
+        out.append(f"## ПРОГОН УПАЛ\n{trace.error}")
+
+    out.append(
+        "## ПОСЧИТАННЫЕ МЕТРИКИ (точные, пересчитывать не нужно)\n"
+        + json.dumps(trace.metrics, ensure_ascii=False, indent=2)
+    )
+    if trace.constraints:
+        out.append("## ОГРАНИЧЕНИЯ, ЗАДАННЫЕ АГЕНТУ\n" + trace.constraints)
+    if trace.reference:
+        out.append("## ЭТАЛОННЫЙ ОТВЕТ\n" + trace.reference)
+
+    return "\n\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# Выход судьи — схема фиксирована и от бенчмарка не зависит
+# --------------------------------------------------------------------------
+Verdict = Literal["pass", "partial", "fail", "n/a"]
+
+
+class Criterion(BaseModel):
+    verdict: Verdict
+    reason: str = Field(description="Одно-два предложения. Без пересказа траектории.")
+    steps: list[int] = Field(
+        default_factory=list,
+        description="Номера шагов траектории, подтверждающие вывод. Обязательны "
+        "для любого вердикта кроме n/a.",
+    )
+
+
+class Judgement(BaseModel):
+    """Оценка одного прогона. Набор критериев один и тот же всегда."""
+
+    tool_necessity: Criterion = Field(
+        description="Нужен ли был вызов инструмента, и вызвал ли агент его тогда, "
+        "когда следовало. Ответ на фактический вопрос без вызова — fail."
+    )
+    tool_selection: Criterion = Field(
+        description="Выбран ли подходящий инструмент из ДОСТУПНЫХ в этом прогоне. "
+        "Если задача требовала инструмента из блока НЕДОСТУПНЫЕ — это не вина "
+        "агента; поставьте n/a и назовите недостающий инструмент в reason."
+    )
+    arguments: Criterion = Field(
+        description="Соответствуют ли аргументы вопросу И схеме инструмента. "
+        "Сверяйтесь со схемой, а не с догадками о домене."
+    )
+    groundedness: Criterion = Field(
+        description="Следует ли каждое утверждение ответа из результатов "
+        "инструментов. Любое число или факт, которого нет в результатах, — fail."
+    )
+    completeness: Criterion = Field(
+        description="Отвечает ли агент на весь заданный вопрос."
+    )
+    efficiency: Criterion = Field(
+        description="Разумна ли траектория: без повторов, лишних шагов и петель."
+    )
+    error_handling: Criterion = Field(
+        description="Адекватно ли агент отреагировал на ошибки. n/a, если ошибок не было."
+    )
+    overall: Literal["pass", "partial", "fail"]
+    summary: str = Field(description="Одно предложение: главная проблема или её отсутствие.")
+
+
+JUDGE_INSTRUCTIONS = """\
+Ты оцениваешь один прогон ИИ-агента. Тебе даны: задача, схемы доступных агенту \
+инструментов, пронумерованная траектория его действий, итоговый ответ и точные \
+метрики, посчитанные заранее.
+
+Правила:
+
+1. Предметную область выводи ИСКЛЮЧИТЕЛЬНО из схем инструментов и результатов \
+вызовов. Никаких собственных знаний о домене — ты не можешь проверить, верно ли \
+число по существу, и не должен пытаться.
+
+1a. Блок ДОСТУПНЫЕ — это полное пространство вариантов, которое было у агента: \
+каждый неиспользованный инструмент оттуда он мог выбрать и не выбрал, и это \
+решение подлежит оценке. Блок НЕДОСТУПНЫЕ до модели не доходил — его \
+неиспользование в вину не ставится, но назвать недостающий инструмент как \
+причину неудачи полезно.
+
+2. Оценивай процесс и внутреннюю согласованность, а не фактическую истинность. \
+Вопрос не «правда ли это», а «следует ли это из того, что агент получил».
+
+3. Каждый вердикт, кроме n/a, подкрепляй номерами шагов в поле steps. Вывод без \
+ссылки на шаги недопустим.
+
+4. Метрики из блока ПОСЧИТАННЫЕ МЕТРИКИ точны. Не пересчитывай их и не спорь с \
+ними — опирайся. Непустой ungrounded_numbers означает groundedness=fail.
+
+5. Шкала трёхзначная: pass — требование выполнено; partial — выполнено с \
+оговорками; fail — нарушено. n/a только там, где критерий неприменим.
+
+6. Не оценивай стиль, тон и длину ответа. Только адекватность и работу с \
+инструментами.
+
+7. Если дан ЭТАЛОННЫЙ ОТВЕТ — сверяйся с ним по существу. Если его нет — \
+оценивай самосогласованность траектории и ответа.
+
+8. overall=fail, если fail стоит в tool_necessity, arguments или groundedness. \
+Это несущие критерии.
+"""

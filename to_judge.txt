@@ -1,6 +1,22 @@
 """
 Общий судья агентских прогонов: адаптер -> канонический трейс -> фиксированный судья.
 
+В модуле фигурируют ДВА агента, и они не пересекаются:
+
+    оцениваемый агент — ваш агент с тулами, ваши Deps, маленькая модель.
+                        Модуль только подглядывает за ним (ToolCatalog).
+    судья             — отдельный агент на большой модели, без тулов,
+                        output_type=Judgement. Создаётся через make_judge().
+                        Видит только текст из render_trace().
+
+Использование:
+
+    catalog = ToolCatalog(agent)                        # 1. до прогона
+    runs = await abatch_run(agent, items, ...)          # 2. как обычно
+    judged = await ajudge(runs, items, catalog=catalog, # 3. оценка
+                          model="Qwen/Qwen3.5-35B-A3B",
+                          base_url="http://localhost:8001/v1")
+
 Принцип: судья не знает предметную область. Домен он получает из схем тулов,
 которые реально ушли модели. Поэтому при смене бенчмарка меняется адаптер
 (`to_trace`), а инструкции и выходная схема судьи остаются те же.
@@ -13,24 +29,35 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Sequence
+import weakref
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+try:
+    from pydantic_ai import RunContext as _RunContext
+except ImportError:  # pragma: no cover — без pydantic-ai работают трейс и рендер
+    _RunContext = Any  # type: ignore[misc,assignment]
 
 __all__ = [
     "ToolSpec",
     "TraceStep",
     "Trace",
     "Judgement",
+    "ToolCatalog",
     "collect_tool_specs",
-    "catalog_hook",
     "unify_catalogs",
     "mark_filtered",
     "capture_tool_catalog",
     "deterministic_metrics",
     "to_trace",
     "render_trace",
+    "make_judge",
+    "ajudge",
+    "Judged",
+    "build_traces",
+    "judge_report",
     "JUDGE_INSTRUCTIONS",
 ]
 
@@ -115,26 +142,55 @@ async def collect_tool_specs(agent: Any, ctx: Any) -> list[ToolSpec]:
     return sorted(specs.values(), key=lambda s: s.name)
 
 
-def catalog_hook(agent: Any, attr: str = "tools") -> Any:
-    """Готовый `@agent.instructions`-хук: кладёт каталог в deps один раз за прогон.
+class ToolCatalog:
+    """Снимает каталог тулов ОЦЕНИВАЕМОГО агента во время его прогонов.
 
-        @dataclass
-        class Deps:
-            df: pd.DataFrame
-            tools: list[ToolSpec] = field(default_factory=list)
+        catalog = ToolCatalog(agent)          # один раз, после регистрации тулов
+        runs = await abatch_run(agent, ...)   # прогоняете как обычно
+        catalog.for_run(runs[0])              # -> list[ToolSpec] этого прогона
 
-        agent.instructions(catalog_hook(agent))
+    Ваши Deps не трогаются: каталог хранится здесь и сопоставляется с прогоном
+    по объекту deps (тот же самый объект лежит в `run.deps`).
 
-    Инструкций не добавляет — возвращает пустую строку.
+    Внутри регистрирует `@agent.instructions`-хук: инструкции выполняются перед
+    каждым запросом к модели, поэтому каталог снимается и в прогонах, где тул
+    так и не вызвали. Текста в инструкции хук не добавляет.
     """
 
-    async def hook(ctx: Any) -> str:
-        store = getattr(ctx.deps, attr, None)
-        if store is not None and not store:
-            store.extend(await collect_tool_specs(agent, ctx))
-        return ""
+    def __init__(self, agent: Any) -> None:
+        self._agent = agent
+        self._store: dict[int, tuple[Any, list[ToolSpec]]] = {}
 
-    return hook
+        async def _hook(ctx: _RunContext) -> str:  # type: ignore[valid-type]
+            key = id(ctx.deps)
+            held = self._store.get(key)
+            if held is None or not self._same(held[0], ctx.deps):
+                specs = await collect_tool_specs(self._agent, ctx)
+                self._store[key] = (self._ref(ctx.deps), specs)
+            return ""
+
+        agent.instructions(_hook)
+
+    @staticmethod
+    def _ref(obj: Any) -> Any:
+        # weakref, чтобы не держать deps живыми; иначе — сильная ссылка
+        try:
+            return weakref.ref(obj)
+        except TypeError:
+            return lambda: obj
+
+    @staticmethod
+    def _same(ref: Any, obj: Any) -> bool:
+        return ref() is obj
+
+    def for_run(self, run: Any) -> list[ToolSpec]:
+        held = self._store.get(id(run.deps))
+        if held is None or not self._same(held[0], run.deps):
+            return []
+        return [s.model_copy() for s in held[1]]
+
+    def clear(self) -> None:
+        self._store.clear()
 
 
 def unify_catalogs(traces: Sequence[Trace]) -> list[ToolSpec]:
@@ -447,3 +503,166 @@ JUDGE_INSTRUCTIONS = """\
 8. overall=fail, если fail стоит в tool_necessity, arguments или groundedness. \
 Это несущие критерии.
 """
+
+
+# --------------------------------------------------------------------------
+# Высокоуровневый вход: прогоны оцениваемого агента -> вердикты судьи
+# --------------------------------------------------------------------------
+_CRITERIA = (
+    "tool_necessity",
+    "tool_selection",
+    "arguments",
+    "groundedness",
+    "completeness",
+    "efficiency",
+    "error_handling",
+)
+
+
+def make_judge(instructions: str = JUDGE_INSTRUCTIONS, **agent_kwargs: Any) -> Any:
+    """Агент-судья: без тулов, без Deps, с фиксированной выходной схемой.
+
+    Модель не задаётся — её подставит `ajudge` (как и в abatch_run).
+    """
+    from pydantic_ai import Agent
+
+    return Agent(output_type=Judgement, instructions=instructions, **agent_kwargs)
+
+
+class Judged(BaseModel):
+    """Результат оценки одного прогона."""
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    index: int
+    trace: Trace
+    judgement: Judgement | None = None
+    judge_error: str | None = None  # упал сам судья, а не агент
+    bad_step_refs: list[int] = Field(default_factory=list)  # ссылки на несуществующие шаги
+
+    @property
+    def ok(self) -> bool:
+        return self.judgement is not None
+
+    @property
+    def overall(self) -> str | None:
+        return self.judgement.overall if self.judgement else None
+
+
+def _task_of(item: Any) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, Mapping) and "user_prompt" in item:
+        return str(item["user_prompt"])
+    raise ValueError(f"не могу достать задачу из элемента: {item!r}")
+
+
+def _check_refs(j: Judgement, n_steps: int) -> list[int]:
+    bad: set[int] = set()
+    for name in _CRITERIA:
+        for i in getattr(j, name).steps:
+            if not 0 <= i < n_steps:
+                bad.add(i)
+    return sorted(bad)
+
+
+def build_traces(
+    runs: Sequence[Any],
+    items: Sequence[Any],
+    *,
+    catalog: ToolCatalog | None = None,
+    history: Callable[[Any], Iterable[str]] | None = None,
+    constraints: str | Callable[[Any], str | None] | None = None,
+    reference: Callable[[Any], str | None] | None = None,
+) -> list[Trace]:
+    """Прогоны + исходные элементы -> трейсы, с размеченным каталогом тулов.
+
+    `history`, `reference` и (если не строка) `constraints` — функции от
+    исходного элемента: так вы достаёте их из своего формата данных, а модуль
+    про этот формат ничего не знает.
+    """
+    if len(runs) != len(items):
+        raise ValueError(f"runs ({len(runs)}) и items ({len(items)}) разной длины")
+
+    traces = []
+    for run, item in zip(runs, items):
+        traces.append(
+            to_trace(
+                run,
+                task=_task_of(item),
+                tools=catalog.for_run(run) if catalog else [],
+                history=history(item) if history else (),
+                constraints=constraints(item) if callable(constraints) else constraints,
+                reference=reference(item) if reference else None,
+            )
+        )
+    mark_filtered(traces)
+    return traces
+
+
+async def ajudge(
+    runs: Sequence[Any],
+    items: Sequence[Any],
+    *,
+    model: str,
+    catalog: ToolCatalog | None = None,
+    judge: Any = None,
+    history: Callable[[Any], Iterable[str]] | None = None,
+    constraints: str | Callable[[Any], str | None] | None = None,
+    reference: Callable[[Any], str | None] | None = None,
+    **batch_kwargs: Any,
+) -> list[Judged]:
+    """Оценивает прогоны оцениваемого агента судьёй. Порядок сохраняется.
+
+    Args:
+        runs: Результат `abatch_run(agent, items, ...)` — прогоны ОЦЕНИВАЕМОГО агента.
+        items: Те же items, что ушли в тот прогон (оттуда берётся текст задачи).
+        model: Модель СУДЬИ. Обычно больше оцениваемой.
+        catalog: `ToolCatalog(agent)`, созданный до прогона. Без него судья не
+            увидит схем тулов и будет оценивать аргументы вслепую.
+        judge: Свой агент-судья; по умолчанию `make_judge()`.
+        **batch_kwargs: Пробрасываются в `abatch_run` для судьи: base_url,
+            concurrency, item_timeout, run_kwargs и т.д.
+    """
+    from simple_batch import abatch_run
+
+    traces = build_traces(
+        runs, items, catalog=catalog, history=history,
+        constraints=constraints, reference=reference,
+    )
+    judge = judge or make_judge()
+    batch_kwargs.setdefault("concurrency", 16)
+
+    jruns = await abatch_run(
+        judge,
+        [{"user_prompt": render_trace(t)} for t in traces],
+        model=model,
+        **batch_kwargs,
+    )
+
+    out: list[Judged] = []
+    for i, (tr, jr) in enumerate(zip(traces, jruns)):
+        if jr.ok:
+            out.append(
+                Judged(index=i, trace=tr, judgement=jr.output,
+                       bad_step_refs=_check_refs(jr.output, len(tr.steps)))
+            )
+        else:
+            out.append(Judged(index=i, trace=tr, judge_error=jr.error_brief))
+    return out
+
+
+def judge_report(judged: Sequence[Judged]) -> dict[str, dict[str, int]]:
+    """Сводка по батчу: сколько pass/partial/fail/n/a на каждый критерий."""
+    report: dict[str, dict[str, int]] = {}
+    for name in (*_CRITERIA, "overall"):
+        counts = {"pass": 0, "partial": 0, "fail": 0, "n/a": 0}
+        for j in judged:
+            if not j.ok:
+                continue
+            v = j.judgement.overall if name == "overall" else getattr(j.judgement, name).verdict
+            counts[v] = counts.get(v, 0) + 1
+        report[name] = counts
+    report["_judge_failed"] = {"count": sum(not j.ok for j in judged)}
+    report["_bad_step_refs"] = {"count": sum(bool(j.bad_step_refs) for j in judged)}
+    return report
